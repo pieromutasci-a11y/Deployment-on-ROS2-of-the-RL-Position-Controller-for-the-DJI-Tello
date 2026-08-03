@@ -117,3 +117,17 @@ ros2 run tello_node position_controller_VICON_VERSION --ros-args \
 Nel terminale dove è attivo il nodo controllore:
 - **`INVIO`** *(riga vuota)*: Avanza al prossimo waypoint (valido solo in `advance_mode:=manual`).
 - **`q`** oppure **`quit`** oppure **`exit`**: Invia l'atterraggio di emergenza immediato (`land`) e chiude il nodo in modo sicuro.
+
+---
+
+## ⏱️ 3. Frequenze dei Calcoli e Loop di Controllo
+
+| Componente / Calcolo | Frequenza | Periodo ($\Delta t$) | Origine e Descrizione |
+| :--- | :---: | :---: | :--- |
+| 🧠 **Loop di Controllo RL (Policy)** | **25 Hz** | **40 ms** | `STEP_DT = 0.04`s. Frequenza di inferenza della rete neurale PyTorch e pubblicazione del comando `geometry_msgs/Twist` su `/tello/cmd_vel`. |
+| 🎯 **Streaming Posa Vicon** | **100 – 200 Hz** | **5 – 10 ms** | Callback ROS2 `pose_cb`. Calcolo derivata velocità, gravità proiettata $\mathbf{g}_b$, e filtro passa-basso ($\alpha=0.3$) su $\mathbf{v}_b$. |
+| 📡 **Tellopy IMU & MVO Log Data** | **10 – 20 Hz** | **50 – 100 ms** | Evento `EVENT_LOG_DATA` del Tello. Lettura giroscopio ($\text{gyro}_x, \text{gyro}_y, \text{gyro}_z$) e velocimetro ottico MVO. |
+| 🔋 **Tellopy Flight Data** | **2 – 5 Hz** | **200 – 500 ms** | Evento `EVENT_FLIGHT_DATA` del Tello. Lettura percentuale batteria e quota sensore. |
+| 🖥️ **Stampa Stato Terminale** | **1 Hz** *(0.5 Hz su `read_sensors`)* | **1.0 s** *(0.5 s)* | Timer ROS2 `status_cb`. Stampa a schermo i log di diagnostica, errore distanza/yaw e stato batteria. |
+| ⌨️ **Polling Tastiera Terminale** | **5 Hz** | **200 ms** | Thread daemon con `select.select()` non bloccante per catturare la pressione di `INVIO` o `q`. |
+
