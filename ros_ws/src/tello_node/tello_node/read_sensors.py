@@ -13,20 +13,34 @@ il controllore vero:
   - tellopy EVENT_LOG_DATA: IMU (gyro_x/y/z), MVO (vel_x/y/z).
   - tellopy EVENT_FLIGHT_DATA: batteria, quota (height), fly_mode.
 
+REGISTRAZIONE E PLOT DATI:
+I dati ricevuti durante l'esecuzione vengono salvati in memoria e, alla
+chiusura del nodo (Ctrl+C o shutdown), vengono automaticamente:
+  1. Salvati in file CSV (nella cartella specificata dal parametro output_dir).
+  2. Graficati e salvati in formato PNG ad alta risoluzione.
+
 Si connette al drone via tellopy SOLO per la telemetria (connect(), MAI
 takeoff/land/comandi di movimento): sicuro da lanciare con il drone a
 terra per controllare che tutte le fonti dati arrivino con valori
 plausibili prima di fidarsi del controllore.
 """
 
+import csv
 import math
+import os
+import sys
 import time
 import threading
+from datetime import datetime
 import numpy as np
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 from scipy.spatial.transform import Rotation as R
+
+import matplotlib
+matplotlib.use('Agg')  # Backend non interattivo per salvataggio figure senza server X
+import matplotlib.pyplot as plt
 
 import tellopy
 
@@ -57,12 +71,26 @@ class SensorReader(Node):
     def __init__(self):
         super().__init__("read_sensors")
 
-        self.declare_parameter("vicon_pose_topic", DEFAULT_VICON_POSE_TOPIC)
-        vicon_pose_topic = self.get_parameter("vicon_pose_topic").get_parameter_value().string_value
+        script_dir = os.path.dirname(os.path.abspath(__file__))
 
-        # -- stato Vicon, protetto da _vicon_lock (pose_cb gira sul thread
-        # executor rclpy, status_cb sullo stesso thread ma via timer: lock
-        # comunque presente per coerenza/robustezza futura) --
+        self.declare_parameter("vicon_pose_topic", DEFAULT_VICON_POSE_TOPIC)
+        self.declare_parameter("output_dir", script_dir)
+        self.declare_parameter("save_csv", True)
+        self.declare_parameter("save_plot", True)
+
+        vicon_pose_topic = self.get_parameter("vicon_pose_topic").get_parameter_value().string_value
+        self.output_dir = self.get_parameter("output_dir").get_parameter_value().string_value
+        self.save_csv_flag = self.get_parameter("save_csv").get_parameter_value().bool_value
+        self.save_plot_flag = self.get_parameter("save_plot").get_parameter_value().bool_value
+
+        self.start_time = time.time()
+
+        # -- registri dati per salvataggio e plot --
+        self.vicon_history = []
+        self.imu_history = []
+        self.flight_history = []
+
+        # -- stato Vicon, protetto da _vicon_lock --
         self._vicon_lock = threading.Lock()
         self.pos = None
         self.yaw = None
@@ -74,8 +102,7 @@ class SensorReader(Node):
         self.pose_rejected_count = 0
         self.last_pose_wall_time = None
 
-        # -- stato tellopy, protetto da _tello_lock (i callback EVENT_*
-        # girano sul thread interno di tellopy, non sul thread rclpy) --
+        # -- stato tellopy, protetto da _tello_lock --
         self._tello_lock = threading.Lock()
         self.gyro = None
         self.mvo_vel = None
@@ -153,6 +180,20 @@ class SensorReader(Node):
             self.pose_count += 1
             self.last_pose_wall_time = time.monotonic()
 
+            t_rel = time.time() - self.start_time
+            self.vicon_history.append({
+                "time": t_rel,
+                "x": p[0], "y": p[1], "z": p[2],
+                "qx": q.x, "qy": q.y, "qz": q.z, "qw": q.w,
+                "yaw_deg": math.degrees(yaw),
+                "proj_grav_x": proj_grav_b[0],
+                "proj_grav_y": proj_grav_b[1],
+                "proj_grav_z": proj_grav_b[2],
+                "lin_vel_b_x": self.lin_vel_b[0],
+                "lin_vel_b_y": self.lin_vel_b[1],
+                "lin_vel_b_z": self.lin_vel_b[2]
+            })
+
     # -------------------- callback tellopy --------------------
     def tello_log_data_cb(self, event, sender, data, **kwargs):
         imu = data.imu
@@ -163,13 +204,31 @@ class SensorReader(Node):
             self.imu_count += 1
             self.last_imu_wall_time = time.monotonic()
 
+            t_rel = time.time() - self.start_time
+            self.imu_history.append({
+                "time": t_rel,
+                "gyro_x": imu.gyro_x, "gyro_y": imu.gyro_y, "gyro_z": imu.gyro_z,
+                "mvo_vel_x": mvo.vel_x, "mvo_vel_y": mvo.vel_y, "mvo_vel_z": mvo.vel_z
+            })
+
     def tello_flight_data_cb(self, event, sender, data, **kwargs):
         with self._tello_lock:
-            self.battery_pct = getattr(data, "battery_percentage", None)
-            self.height_dm = getattr(data, "height", None)
-            self.fly_mode = getattr(data, "fly_mode", None)
+            bat = getattr(data, "battery_percentage", None)
+            h_dm = getattr(data, "height", None)
+            fm = getattr(data, "fly_mode", None)
+            self.battery_pct = bat
+            self.height_dm = h_dm
+            self.fly_mode = fm
             self.flight_data_count += 1
             self.last_flight_wall_time = time.monotonic()
+
+            t_rel = time.time() - self.start_time
+            self.flight_history.append({
+                "time": t_rel,
+                "battery": bat,
+                "height_dm": h_dm,
+                "fly_mode": fm
+            })
 
     # -------------------- stampa periodica --------------------
     def status_cb(self):
@@ -218,6 +277,172 @@ class SensorReader(Node):
 
         self.get_logger().info("-" * 70)
 
+    # -------------------- salvataggio CSV e grafico PLOT --------------------
+    def save_data_and_plots(self):
+        self.get_logger().info("Avvio salvataggio dati e generazione grafici...")
+        os.makedirs(self.output_dir, exist_ok=True)
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        with self._vicon_lock:
+            vicon_data = list(self.vicon_history)
+        with self._tello_lock:
+            imu_data = list(self.imu_history)
+            flight_data = list(self.flight_history)
+
+        total_samples = len(vicon_data) + len(imu_data) + len(flight_data)
+        if total_samples == 0:
+            self.get_logger().warn("Nessun dato registrato durante la sessione, skip salvataggio.")
+            return
+
+        # 1. Salvataggio CSV
+        if self.save_csv_flag:
+            if vicon_data:
+                vicon_csv = os.path.join(self.output_dir, f"sensor_vicon_{timestamp_str}.csv")
+                try:
+                    with open(vicon_csv, "w", newline="") as f:
+                        writer = csv.DictWriter(f, fieldnames=vicon_data[0].keys())
+                        writer.writeheader()
+                        writer.writerows(vicon_data)
+                    self.get_logger().info(f"Dati Vicon salvati in: {vicon_csv}")
+                except Exception as e:
+                    self.get_logger().error(f"Errore salvataggio Vicon CSV: {e}")
+
+            if imu_data:
+                imu_csv = os.path.join(self.output_dir, f"sensor_tello_imu_{timestamp_str}.csv")
+                try:
+                    with open(imu_csv, "w", newline="") as f:
+                        writer = csv.DictWriter(f, fieldnames=imu_data[0].keys())
+                        writer.writeheader()
+                        writer.writerows(imu_data)
+                    self.get_logger().info(f"Dati Tello IMU salvati in: {imu_csv}")
+                except Exception as e:
+                    self.get_logger().error(f"Errore salvataggio Tello IMU CSV: {e}")
+
+            if flight_data:
+                flight_csv = os.path.join(self.output_dir, f"sensor_tello_flight_{timestamp_str}.csv")
+                try:
+                    with open(flight_csv, "w", newline="") as f:
+                        writer = csv.DictWriter(f, fieldnames=flight_data[0].keys())
+                        writer.writeheader()
+                        writer.writerows(flight_data)
+                    self.get_logger().info(f"Dati Tello Flight salvati in: {flight_csv}")
+                except Exception as e:
+                    self.get_logger().error(f"Errore salvataggio Tello Flight CSV: {e}")
+
+        # 2. Generazione e salvataggio Grafici PLOT
+        if self.save_plot_flag:
+            plot_png = os.path.join(self.output_dir, f"sensor_plots_{timestamp_str}.png")
+            try:
+                fig = plt.figure(figsize=(16, 12))
+                fig.suptitle(f"Sensor Data Overview ({timestamp_str})", fontsize=16, fontweight='bold')
+
+                # Subplot 1: Vicon Position (X, Y, Z) vs Time
+                ax1 = fig.add_subplot(3, 2, 1)
+                if vicon_data:
+                    t_vicon = [d["time"] for d in vicon_data]
+                    ax1.plot(t_vicon, [d["x"] for d in vicon_data], label="Pos X (m)", color="r")
+                    ax1.plot(t_vicon, [d["y"] for d in vicon_data], label="Pos Y (m)", color="g")
+                    ax1.plot(t_vicon, [d["z"] for d in vicon_data], label="Pos Z (m)", color="b")
+                    ax1.set_xlabel("Time (s)")
+                    ax1.set_ylabel("Position (m)")
+                    ax1.set_title("Vicon Position")
+                    ax1.grid(True)
+                    ax1.legend()
+                else:
+                    ax1.set_title("Vicon Position (No Data)")
+
+                # Subplot 2: Traiettoria 3D Vicon
+                ax2 = fig.add_subplot(3, 2, 2, projection='3d')
+                if vicon_data:
+                    x_v = [d["x"] for d in vicon_data]
+                    y_v = [d["y"] for d in vicon_data]
+                    z_v = [d["z"] for d in vicon_data]
+                    ax2.plot(x_v, y_v, z_v, label="3D Path", color="purple")
+                    ax2.scatter(x_v[0], y_v[0], z_v[0], color="green", s=40, label="Start")
+                    ax2.scatter(x_v[-1], y_v[-1], z_v[-1], color="red", s=40, label="End")
+                    ax2.set_xlabel("X (m)")
+                    ax2.set_ylabel("Y (m)")
+                    ax2.set_zlabel("Z (m)")
+                    ax2.set_title("Vicon 3D Trajectory")
+                    ax2.legend()
+                else:
+                    ax2.set_title("Vicon 3D Trajectory (No Data)")
+
+                # Subplot 3: Vicon Yaw e Gravita' Proiettata (Body)
+                ax3 = fig.add_subplot(3, 2, 3)
+                if vicon_data:
+                    t_vicon = [d["time"] for d in vicon_data]
+                    ax3.plot(t_vicon, [d["yaw_deg"] for d in vicon_data], label="Yaw (deg)", color="black")
+                    ax3.plot(t_vicon, [d["proj_grav_x"] for d in vicon_data], label="Proj Grav X", color="m", linestyle="--")
+                    ax3.plot(t_vicon, [d["proj_grav_y"] for d in vicon_data], label="Proj Grav Y", color="c", linestyle="--")
+                    ax3.plot(t_vicon, [d["proj_grav_z"] for d in vicon_data], label="Proj Grav Z", color="y", linestyle="--")
+                    ax3.set_xlabel("Time (s)")
+                    ax3.set_ylabel("Yaw / Grav Vector")
+                    ax3.set_title("Vicon Yaw & Projected Gravity Body")
+                    ax3.grid(True)
+                    ax3.legend()
+                else:
+                    ax3.set_title("Vicon Yaw & Grav (No Data)")
+
+                # Subplot 4: Velocita' Lineare (Vicon Body vs Tello MVO)
+                ax4 = fig.add_subplot(3, 2, 4)
+                if vicon_data:
+                    t_vicon = [d["time"] for d in vicon_data]
+                    ax4.plot(t_vicon, [d["lin_vel_b_x"] for d in vicon_data], label="Vicon LinVel X (m/s)", color="r")
+                    ax4.plot(t_vicon, [d["lin_vel_b_y"] for d in vicon_data], label="Vicon LinVel Y (m/s)", color="g")
+                    ax4.plot(t_vicon, [d["lin_vel_b_z"] for d in vicon_data], label="Vicon LinVel Z (m/s)", color="b")
+                if imu_data:
+                    t_imu = [d["time"] for d in imu_data]
+                    ax4.plot(t_imu, [d["mvo_vel_x"] for d in imu_data], label="MVO Vel X", color="r", linestyle=":")
+                    ax4.plot(t_imu, [d["mvo_vel_y"] for d in imu_data], label="MVO Vel Y", color="g", linestyle=":")
+                    ax4.plot(t_imu, [d["mvo_vel_z"] for d in imu_data], label="MVO Vel Z", color="b", linestyle=":")
+                ax4.set_xlabel("Time (s)")
+                ax4.set_ylabel("Vel (m/s)")
+                ax4.set_title("Linear Velocity (Vicon vs Tello MVO)")
+                ax4.grid(True)
+                ax4.legend()
+
+                # Subplot 5: Giroscopio Tellopy IMU
+                ax5 = fig.add_subplot(3, 2, 5)
+                if imu_data:
+                    t_imu = [d["time"] for d in imu_data]
+                    ax5.plot(t_imu, [d["gyro_x"] for d in imu_data], label="Gyro X", color="darkred")
+                    ax5.plot(t_imu, [d["gyro_y"] for d in imu_data], label="Gyro Y", color="darkgreen")
+                    ax5.plot(t_imu, [d["gyro_z"] for d in imu_data], label="Gyro Z", color="darkblue")
+                    ax5.set_xlabel("Time (s)")
+                    ax5.set_ylabel("Gyro (rad/s)")
+                    ax5.set_title("Tellopy IMU Gyroscope")
+                    ax5.grid(True)
+                    ax5.legend()
+                else:
+                    ax5.set_title("Tellopy IMU Gyroscope (No Data)")
+
+                # Subplot 6: Batteria e Quota Tello Flight Data
+                ax6 = fig.add_subplot(3, 2, 6)
+                if flight_data:
+                    t_fl = [d["time"] for d in flight_data]
+                    bat_vals = [d["battery"] for d in flight_data if d["battery"] is not None]
+                    h_vals = [d["height_dm"] / 10.0 if d["height_dm"] is not None else None for d in flight_data]
+                    
+                    if any(b is not None for b in bat_vals):
+                        ax6.plot(t_fl, [d["battery"] for d in flight_data], label="Battery (%)", color="orange")
+                    if any(h is not None for h in h_vals):
+                        ax6.plot(t_fl, h_vals, label="Height (m)", color="teal")
+                    ax6.set_xlabel("Time (s)")
+                    ax6.set_ylabel("Value")
+                    ax6.set_title("Tello Flight Data (Battery & Height)")
+                    ax6.grid(True)
+                    ax6.legend()
+                else:
+                    ax6.set_title("Tello Flight Data (No Data)")
+
+                plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+                plt.savefig(plot_png, dpi=200)
+                plt.close(fig)
+                self.get_logger().info(f"Grafici dei sensori salvati in: {plot_png}")
+            except Exception as e:
+                self.get_logger().error(f"Errore durante il plot dei grafici: {e}")
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -227,6 +452,7 @@ def main(args=None):
     except KeyboardInterrupt:
         node.get_logger().info("Interruzione richiesta (Ctrl+C): chiudo.")
     finally:
+        node.save_data_and_plots()
         try:
             node.drone.quit()
         except Exception:
@@ -238,3 +464,4 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
+
