@@ -1,0 +1,9 @@
+# colcon build artifacts (rigenerati da ./docker_ws/build.sh + colcon build)
+ros_ws/build/
+ros_ws/install/
+ros_ws/log/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
