@@ -6,6 +6,13 @@ setup(
     name=package_name,
     version='0.0.0',
     packages=find_packages(exclude=['test']),
+    package_data={
+        package_name: [
+            'web_static/*',
+            'web_static/vendor/*',
+        ],
+    },
+    include_package_data=True,
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
@@ -25,6 +32,7 @@ setup(
     entry_points={
         'console_scripts': [
             'position_controller_VICON_VERSION=tello_node.position_controller_VICON_VERSION:main',
+            'position_controller_web=tello_node.position_controller_web:main',
             'read_sensors=tello_node.read_sensors:main',
             'takeoff_land=tello_node.takeoff_land:main',
         ],

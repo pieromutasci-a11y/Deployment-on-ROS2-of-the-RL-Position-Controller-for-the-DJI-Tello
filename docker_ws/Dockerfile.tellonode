@@ -44,6 +44,14 @@ RUN python3 -m pip install --no-cache-dir \
     onnxruntime \
     skrl
 
+# Installazione librerie per l'interfaccia web del position_controller
+# (FastAPI + uvicorn con supporto WebSocket per lo stato in tempo reale
+# del drone, servito nello stesso processo del nodo ROS2).
+RUN python3 -m pip install --no-cache-dir \
+    fastapi \
+    "uvicorn[standard]" \
+    websockets
+
 # Installazione librerie per Drone Tello usate nel progetto:
 # - tellopy (usata in test_tellopy.py)
 # - djitellopy (usata per comandi socket / read_sensors.py)
@@ -78,5 +86,11 @@ RUN echo "source /opt/ros/humble/setup.bash" >> /root/.bashrc
 # 8890: Telemetria / Stato del drone (UDP)
 # 11111: Streaming video H.264 (UDP)
 EXPOSE 8889/udp 8890/udp 11111/udp
+
+# Porta TCP per l'interfaccia web del position_controller (FastAPI/uvicorn +
+# WebSocket di stato). Ininfluente se il container gira con --network host
+# (porta gia' condivisa con l'host), ma dichiarata per chiarezza nel caso
+# in futuro si cambi modalita' di rete.
+EXPOSE 8080/tcp
 
 CMD ["bash"]

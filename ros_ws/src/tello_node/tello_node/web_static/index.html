@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Position Controller — Dashboard</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Position Controller</h1>
+    <div id="conn-indicators">
+      <span id="ind-vicon" class="indicator off">VICON</span>
+      <span id="ind-tello" class="indicator off">TELLO</span>
+      <span id="ind-battery" class="indicator off">BATT --%</span>
+      <span id="ind-session" class="indicator off">IDLE</span>
+    </div>
+  </header>
+
+  <main>
+    <section id="scene-panel">
+      <div id="three-container"></div>
+    </section>
+
+    <section id="plots-panel">
+      <div id="plots-row">
+        <div class="plot-box">
+          <h3>Linear velocity (m/s)</h3>
+          <canvas id="plot-linvel" width="400" height="110"></canvas>
+        </div>
+        <div class="plot-box">
+          <h3>Angular velocity (rad/s)</h3>
+          <canvas id="plot-angvel" width="400" height="110"></canvas>
+        </div>
+        <div class="plot-box">
+          <h3>Orientation (deg)</h3>
+          <canvas id="plot-rpy" width="400" height="110"></canvas>
+        </div>
+      </div>
+    </section>
+
+    <section id="control-panel">
+      <h2>Parameters</h2>
+      <form id="params-form">
+        <label>DoF mask
+          <select name="dof_mask_mode">
+            <option value="full">full</option>
+            <option value="uniciclo">uniciclo</option>
+          </select>
+        </label>
+        <label>Target mode
+          <select name="target_mode">
+            <option value="variabile">variable</option>
+            <option value="singolo">single</option>
+          </select>
+        </label>
+        <label>Advance mode
+          <select name="advance_mode">
+            <option value="manual">manual</option>
+            <option value="auto">auto</option>
+          </select>
+        </label>
+        <label>Num queues (-1 = infinite)
+          <input type="number" name="num_queues" value="-1">
+        </label>
+        <button type="submit">Set parameters</button>
+      </form>
+      <div id="params-msg"></div>
+
+      <h2>Flight</h2>
+      <div id="flight-buttons">
+        <button id="btn-start">Start algorithm</button>
+        <button id="btn-land">Land</button>
+        <button id="btn-advance">Next waypoint</button>
+      </div>
+
+      <h2>Status</h2>
+      <table id="status-table">
+        <tr><td>Session</td><td id="s-session">--</td></tr>
+        <tr><td>Queue</td><td id="s-queue">--</td></tr>
+        <tr><td>Waypoint</td><td id="s-wp">--</td></tr>
+        <tr><td>Position (m)</td><td id="s-pos">--</td></tr>
+        <tr><td>Roll / Pitch / Yaw (deg)</td><td id="s-rpy">--</td></tr>
+      </table>
+    </section>
+  </main>
+
+  <script src="vendor/three.min.js"></script>
+  <script src="vendor/OrbitControls.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

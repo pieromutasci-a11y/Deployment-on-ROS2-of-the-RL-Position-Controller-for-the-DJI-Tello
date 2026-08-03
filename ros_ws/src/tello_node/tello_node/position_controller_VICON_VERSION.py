@@ -63,13 +63,38 @@ Nel terminale dove gira il nodo (thread stdin non bloccante, select()):
     INVIO (riga vuota)  -> avanza al PROSSIMO waypoint (solo advance_mode=manual)
     q / quit / exit     -> atterra e chiude il nodo (sempre attivo)
 
+AGGIORNAMENTO — FUNZIONI DI EMERGENZA:
+  - NUOVO: emergency_land(reason), metodo UNIVERSALE per l'atterraggio
+    d'emergenza. Non controlla e non dipende da nessuno stato interno
+    prima di agire: chiama direttamente land_sequence() (gia' idempotente
+    grazie a self._landing_started). E' il percorso UNICO usato ora da
+    tutti i trigger di emergenza (batteria critica, Vicon perso, tellopy
+    perso), cosi' che siano tutti garantiti allo stesso modo.
+  - NUOVO: escalation automatica se la pose Vicon manca (mai arrivata o
+    persa a meta' volo) per oltre POSE_LOST_LAND_TIMEOUT_S secondi
+    CONSECUTIVI -> atterraggio automatico via emergency_land(). Se il
+    Vicon torna prima di quella soglia, il timer si azzera e non succede
+    nulla di piu' del solito Twist nullo pubblicato nel frattempo.
+  - NUOVO: stessa identica logica per i dati tellopy (IMU/batteria/quota):
+    se non arriva nulla da tellopy per oltre TELLO_LOST_LAND_TIMEOUT_S
+    secondi CONSECUTIVI -> atterraggio automatico. Il comportamento
+    esistente di REQUIRE_IMU (blocco immediato se True, tolleranza nel
+    breve termine se False) resta INVARIATO: l'escalation si applica IN
+    AGGIUNTA, indipendentemente dal valore di REQUIRE_IMU.
+  - Il failsafe batteria critica (gia' esistente) ora passa anch'esso da
+    emergency_land(), invece di chiamare land_sequence() direttamente:
+    stesso risultato pratico, ma ora e' lanciato in un thread separato
+    (prima bloccava il thread interno di tellopy per 5+ secondi durante
+    il time.sleep() dentro land_sequence()).
+  - 'q'/Ctrl+C da terminale restano INVARIATI: erano gia' incondizionati
+    (chiamano land_sequence() direttamente), quindi gia' equivalenti a
+    un'emergenza universale per costruzione.
+
 RESTA INVARIATO rispetto alle versioni precedenti:
   - struttura osservazione a 52 elementi, ordine e normalizzazione.
   - proj_grav_b e lin_vel_b calcolate con rotazione ESATTA (quaternione
     completo) dal Vicon, non piu' approssimazione solo-yaw.
   - sanity check mocap (NaN/Inf, quaternione degenere, jump).
-  - watchdog pose Vicon e IMU (alimentato da EVENT_LOG_DATA tellopy).
-  - failsafe batteria critica -> land automatico.
   - cap di sicurezza assoluto sulle velocita' comandate.
   - takeoff/land/IMU tramite tellopy.
 
@@ -100,6 +125,8 @@ ASSUNZIONI DA VERIFICARE PRIMA DEL VOLO:
   11) advance_mode=uniciclo con hard-mask sull'azione: comportamento piu'
       stretto di quanto visto in training (vedi nota su dof_mask_mode
       sopra), da validare in volo a bassa quota prima di fidarsene.
+  12) POSE_LOST_LAND_TIMEOUT_S / TELLO_LOST_LAND_TIMEOUT_S (3.0s
+      entrambe): soglie di default, da validare/tarare in laboratorio.
 """
 
 import math
@@ -161,10 +188,12 @@ VICON_POSE_TOPIC = "/vicon/tello/pose"
 CMD_VEL_TOPIC = "/tello/cmd_vel"
 
 POSE_TIMEOUT_S = 0.5   # safety: se non arriva pose Vicon entro questo tempo, ferma il drone
+POSE_LOST_LAND_TIMEOUT_S = 3.0   # NUOVO: pose Vicon assente CONTINUATIVAMENTE oltre questo -> atterraggio automatico
 
 # -- watchdog IMU (alimentato da EVENT_LOG_DATA di tellopy) --
 IMU_TIMEOUT_S = 0.5
 REQUIRE_IMU = False
+TELLO_LOST_LAND_TIMEOUT_S = 3.0   # NUOVO: dati tellopy assenti CONTINUATIVAMENTE oltre questo -> atterraggio automatico
 
 # -- sanity check sui dati mocap --
 MAX_PLAUSIBLE_SPEED_MPS = 5.0
@@ -388,6 +417,10 @@ class PositionController(Node):
 
         self._mocap_rejected_count = 0
 
+        # -- NUOVO: stato per l'escalation automatica verso emergency_land() --
+        self._pose_lost_since = None
+        self._tello_lost_since = None
+
         # -- ROS I/O: Vicon (input, stato del drone) + cmd_vel (OUTPUT,
         # letto da un nodo PID separato lato drone). I target NON arrivano
         # piu' da topic: sono generati random dentro la stanza (vedi
@@ -573,7 +606,9 @@ class PositionController(Node):
             self.get_logger().error(
                 f"[tellopy] BATTERIA CRITICA ({battery}%): avvio LAND di emergenza."
             )
-            self.land_sequence()
+            threading.Thread(
+                target=self.emergency_land, args=(f"batteria critica ({battery}%)",), daemon=True
+            ).start()
 
     # ==================================================================
     # -- TAKEOFF / LAND tramite tellopy (NESSUN comando di movimento qui) --
@@ -653,6 +688,20 @@ class PositionController(Node):
             pass
         self.get_logger().info("[tellopy] connessione chiusa.")
 
+    def emergency_land(self, reason: str = "richiesta manuale"):
+        """
+        NUOVO: atterraggio d'EMERGENZA. NON controlla e NON dipende da
+        nessuno stato interno prima di agire: chiama direttamente
+        land_sequence() (gia' idempotente grazie a self._landing_started),
+        quindi e' sempre sicuro invocarla, da qualunque punto del codice
+        e in qualunque momento. E' il percorso UNICO usato ora da tutti i
+        trigger di emergenza (batteria critica, Vicon perso, tellopy
+        perso).
+        """
+        self.get_logger().error(f"[EMERGENZA] Atterraggio forzato: {reason}")
+        self.flight_ready = False
+        self.land_sequence()
+
     # -------------------- callback Vicon --------------------
     def pose_cb(self, msg: PoseStamped):
         t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
@@ -713,37 +762,62 @@ class PositionController(Node):
         if self._shutdown_requested:
             return
 
-        if not self.pose_received:
-            return
-        if (time.monotonic() - self.last_pose_wall_time) > POSE_TIMEOUT_S:
-            self.get_logger().warn("Pose mocap scaduta: pubblico Twist nullo su cmd_vel (failsafe).")
+        # -- NUOVO: pose Vicon mai arrivata o persa a meta' volo. Se
+        # l'assenza persiste CONTINUATIVAMENTE oltre POSE_LOST_LAND_TIMEOUT_S,
+        # atterraggio automatico via emergency_land(). Se il Vicon torna
+        # prima di quella soglia, il timer si azzera senza altre conseguenze. --
+        now_mono = time.monotonic()
+        pose_age = (now_mono - self.last_pose_wall_time) if self.pose_received else float("inf")
+        if pose_age > POSE_TIMEOUT_S:
             self._publish_zero_twist()
+            if self._pose_lost_since is None:
+                self._pose_lost_since = now_mono
+                self.get_logger().warn("Pose Vicon scaduta/mai arrivata: pubblico Twist nullo su cmd_vel.")
+            elif now_mono - self._pose_lost_since > POSE_LOST_LAND_TIMEOUT_S:
+                threading.Thread(
+                    target=self.emergency_land,
+                    args=(f"Vicon assente da oltre {POSE_LOST_LAND_TIMEOUT_S}s",),
+                    daemon=True,
+                ).start()
             return
+        self._pose_lost_since = None
 
+        # -- NUOVO: stessa logica di escalation per i dati tellopy
+        # (IMU/batteria/quota). REQUIRE_IMU continua a comportarsi come
+        # prima (blocco immediato se True); l'escalation si applica IN
+        # AGGIUNTA, indipendentemente dal valore di REQUIRE_IMU. --
         with self._tello_lock:
             imu_ok = self.imu_received
             last_imu_t = self.last_imu_wall_time
-        imu_stale = (not imu_ok) or (
-            last_imu_t is not None and (time.monotonic() - last_imu_t) > IMU_TIMEOUT_S
-        )
+        now_mono_tello = time.monotonic()
+        imu_age = (now_mono_tello - last_imu_t) if (imu_ok and last_imu_t is not None) else float("inf")
+        imu_stale = imu_age > IMU_TIMEOUT_S
+
         if imu_stale:
+            if not self._imu_warned:
+                self.get_logger().warn(
+                    "IMU/tellopy scaduta o mai arrivata: procedo con ang_vel_b invariato "
+                    "(REQUIRE_IMU=False), ma monitoro per eventuale escalation."
+                )
+                self._imu_warned = True
+
+            if self._tello_lost_since is None:
+                self._tello_lost_since = now_mono_tello
+            elif now_mono_tello - self._tello_lost_since > TELLO_LOST_LAND_TIMEOUT_S:
+                threading.Thread(
+                    target=self.emergency_land,
+                    args=(f"dati tellopy assenti da oltre {TELLO_LOST_LAND_TIMEOUT_S}s",),
+                    daemon=True,
+                ).start()
+                return
+
             if REQUIRE_IMU:
-                if not self._imu_warned:
-                    self.get_logger().error(
-                        "IMU tellopy scaduta/assente e REQUIRE_IMU=True: Twist nullo su cmd_vel (failsafe)."
-                    )
-                    self._imu_warned = True
                 self._publish_zero_twist()
                 return
-            else:
-                if not self._imu_warned:
-                    self.get_logger().warn(
-                        "IMU tellopy non disponibile/scaduta: procedo con ang_vel_b invariato "
-                        "(REQUIRE_IMU=False)."
-                    )
-                    self._imu_warned = True
+            # REQUIRE_IMU=False: si continua comunque nel breve termine, come prima
         else:
             self._imu_warned = False
+            self._tello_lost_since = None
 
         pos_env = self.pos_env
         yaw = self.yaw
