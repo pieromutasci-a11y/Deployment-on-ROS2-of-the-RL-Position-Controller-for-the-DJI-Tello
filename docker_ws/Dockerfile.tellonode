@@ -53,13 +53,14 @@ RUN python3 -m pip install --no-cache-dir \
     websockets
 
 # Installazione librerie per Drone Tello usate nel progetto:
-# - tellopy (usata in test_tellopy.py)
-# - djitellopy (usata per comandi socket / read_sensors.py)
+# - djitellopy (UNICA libreria drone: comandi, rc control, telemetria SDK)
+#   tellopy/TelloPy RIMOSSA: non convive con djitellopy sullo stesso drone
+#   (entrando in modalita' SDK il firmware smette di alimentare il flusso
+#   di log binario "app" da cui tellopy leggeva il giroscopio).
 # - av (PyAV per decodifica video H.264 dallo socket UDP del Tello)
 # - opencv-python-headless (per elaborazione frame immagini)
 RUN python3 -m pip install --no-cache-dir \
     djitellopy \
-    git+https://github.com/hanyazou/TelloPy.git \
     av \
     opencv-python-headless
 

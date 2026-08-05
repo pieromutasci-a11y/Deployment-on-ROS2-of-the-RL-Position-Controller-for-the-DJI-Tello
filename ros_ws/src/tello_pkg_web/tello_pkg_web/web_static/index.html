@@ -48,9 +48,12 @@
           </select>
         </label>
         <label>Target mode
-          <select name="target_mode">
+          <select name="target_mode" id="select-target-mode">
             <option value="variabile">variable</option>
             <option value="singolo">single</option>
+            <option value="custom">custom (click on floor)</option>
+            <option value="hover">hover (hold takeoff position)</option>
+            <option value="aruco_target">aruco target (follow ArUco marker)</option>
           </select>
         </label>
         <label>Advance mode
@@ -66,6 +69,16 @@
       </form>
       <div id="params-msg"></div>
 
+      <div id="custom-target-panel" hidden>
+        <h2>Custom target (click on floor in the 3D view)</h2>
+        <label>Target height Z (m)
+          <input type="range" id="custom-target-z" min="0" max="2" step="0.05" value="1.0">
+          <span id="custom-target-z-val">1.00 m</span>
+        </label>
+        <div id="custom-target-hint">Click on the room floor grid to place the target.</div>
+        <div id="custom-target-msg"></div>
+      </div>
+
       <h2>Flight</h2>
       <div id="flight-buttons">
         <button id="btn-start">Start algorithm</button>
@@ -80,6 +93,8 @@
         <tr><td>Waypoint</td><td id="s-wp">--</td></tr>
         <tr><td>Position (m)</td><td id="s-pos">--</td></tr>
         <tr><td>Roll / Pitch / Yaw (deg)</td><td id="s-rpy">--</td></tr>
+        <tr><td>Custom target (m)</td><td id="s-custom-target">--</td></tr>
+        <tr><td>ArUco marker (m)</td><td id="s-aruco">--</td></tr>
       </table>
     </section>
   </main>

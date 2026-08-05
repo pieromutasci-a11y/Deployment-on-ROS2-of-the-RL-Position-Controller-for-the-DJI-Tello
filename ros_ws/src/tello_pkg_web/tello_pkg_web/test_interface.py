@@ -42,6 +42,7 @@ mock_state = {
     "queues_completed": 0,
     "wp_idx": 0,
     "n_waypoints": 4,
+    "custom_target": None,   # [x, y, z] impostato via /api/custom_target
     "t0": time.time(),
 }
 
@@ -69,7 +70,10 @@ def generate_fake_state():
         vy = radius * omega * math.cos(omega * elapsed)
         vz = 0.3 * 0.2 * math.cos(0.2 * elapsed)
         wx, wy, wz = 0.05, 0.03, omega
-        target = [1.0, -1.0, 1.5]
+        if mock_state["target_mode"] == "custom" and mock_state["custom_target"] is not None:
+            target = list(mock_state["custom_target"])
+        else:
+            target = [1.0, -1.0, 1.5]
         battery = max(10, 100 - int(elapsed * 0.5))  # scende lentamente
     else:
         x, y, z = 0.0, 0.0, 0.15
@@ -77,6 +81,15 @@ def generate_fake_state():
         vx = vy = vz = wx = wy = wz = 0.0
         target = None
         battery = 87
+
+    # -- marker ArUco finto: si muove SEMPRE (indipendentemente da
+    # session_state/target_mode), stessa idea del nodo reale che lo
+    # sottoscrive in continuo solo per farlo vedere in scena. --
+    aruco_pos = [
+        1.2 * math.cos(0.25 * elapsed),
+        1.2 * math.sin(0.25 * elapsed),
+        0.3,
+    ]
 
     return {
         "t": now,
@@ -91,6 +104,8 @@ def generate_fake_state():
         "lin_vel_b": [vx, vy, vz],
         "ang_vel_b": [wx, wy, wz],
         "target": target,
+        "aruco_pos": aruco_pos,
+        "custom_target": mock_state["custom_target"],
         "room_min": ROOM_MIN,
         "room_max": ROOM_MAX,
         "wp_idx": mock_state["wp_idx"],
@@ -108,6 +123,12 @@ class ParamsIn(BaseModel):
     target_mode: str
     advance_mode: str
     num_queues: int
+
+
+class CustomTargetIn(BaseModel):
+    x: float
+    y: float
+    z: float
 
 
 app = FastAPI()
@@ -131,6 +152,15 @@ def post_params(params: ParamsIn):
     mock_state["queues_completed"] = 0
     mock_state["wp_idx"] = 0
     return {"ok": True, "message": "Parametri impostati (finto)."}
+
+
+@app.post("/api/custom_target")
+def post_custom_target(t: CustomTargetIn):
+    lo, hi = ROOM_MIN, ROOM_MAX
+    if not (lo[0] <= t.x <= hi[0] and lo[1] <= t.y <= hi[1] and lo[2] <= t.z <= hi[2]):
+        return {"ok": False, "message": f"Fuori dai limiti della stanza {lo}..{hi} (finto)."}
+    mock_state["custom_target"] = [t.x, t.y, t.z]
+    return {"ok": True, "message": "custom_target impostato (finto)."}
 
 
 @app.post("/api/start")

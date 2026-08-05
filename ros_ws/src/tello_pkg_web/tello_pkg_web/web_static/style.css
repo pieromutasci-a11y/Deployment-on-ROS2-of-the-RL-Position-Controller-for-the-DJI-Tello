@@ -57,6 +57,12 @@ main {
   position: relative;
 }
 #three-container { width: 100%; height: 100%; }
+#three-container.placement-mode { cursor: crosshair; }
+
+#custom-target-panel { margin-bottom: 10px; }
+#custom-target-hint { font-size: 11px; color: #999; margin-top: 4px; }
+#custom-target-msg { font-size: 11px; margin-top: 4px; color: #9c9; min-height: 14px; }
+#custom-target-z-val { display: inline-block; margin-left: 6px; font-size: 11px; color: #999; }
 
 #plots-panel {
   grid-column: 1;

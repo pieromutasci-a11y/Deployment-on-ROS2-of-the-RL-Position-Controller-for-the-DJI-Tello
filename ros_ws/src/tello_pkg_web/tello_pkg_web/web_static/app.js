@@ -10,12 +10,25 @@ function viconToThree(p) {
   return new THREE.Vector3(p[1], p[2], p[0]);
 }
 
+// Inversa di viconToThree: da un punto Three.js a coordinate Vicon [x,y,z].
+function threeToVicon(v) {
+  return [v.z, v.x, v.y];
+}
+
 // ============================================================
 // SCENA THREE.JS
 // ============================================================
 let scene, camera, renderer, controls;
-let droneMesh, targetMesh, roomWireframe;
+let droneMesh, targetMesh, arucoMesh, roomWireframe;
 let roomBoundsSet = false;
+let latestRoomMin = null, latestRoomMax = null;
+
+// -- piazzamento target custom: raycast contro un piano orizzontale
+// all'altezza scelta dallo slider (coordinate Vicon), attivo solo quando
+// target_mode=='custom' e' selezionato nel form. --
+const raycaster = new THREE.Raycaster();
+const placementPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+let pointerDownPos = null;
 
 function initScene() {
   const container = document.getElementById('three-container');
@@ -49,16 +62,88 @@ function initScene() {
   targetMesh.visible = false;
   scene.add(targetMesh);
 
+  const arucoGeo = new THREE.BoxGeometry(0.09, 0.09, 0.09);
+  const arucoMat = new THREE.MeshBasicMaterial({ color: 0xbb66ff });
+  arucoMesh = new THREE.Mesh(arucoGeo, arucoMat);
+  arucoMesh.visible = false;
+  scene.add(arucoMesh);
+
   window.addEventListener('resize', () => {
     camera.aspect = container.clientWidth / container.clientHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(container.clientWidth, container.clientHeight);
   });
 
+  renderer.domElement.addEventListener('pointerdown', (ev) => {
+    pointerDownPos = { x: ev.clientX, y: ev.clientY };
+  });
+  renderer.domElement.addEventListener('pointerup', (ev) => {
+    if (!pointerDownPos) return;
+    const dx = ev.clientX - pointerDownPos.x;
+    const dy = ev.clientY - pointerDownPos.y;
+    pointerDownPos = null;
+    // solo un vero CLICK (non un drag di OrbitControls) piazza il target
+    if (Math.hypot(dx, dy) > 4) return;
+    handleSceneClick(ev);
+  });
+
   animate();
 }
 
+// ============================================================
+// PIAZZAMENTO TARGET CUSTOM (click sulla scena 3D)
+// ============================================================
+function handleSceneClick(ev) {
+  const modeSelect = document.getElementById('select-target-mode');
+  if (!modeSelect || modeSelect.value !== 'custom') return;
+  if (!latestRoomMin || !latestRoomMax) return;
+
+  const zInput = document.getElementById('custom-target-z');
+  const zVicon = parseFloat(zInput.value);
+  placementPlane.constant = -zVicon; // piano y = zVicon in coordinate Three (Vicon Z -> Three Y)
+
+  const rect = renderer.domElement.getBoundingClientRect();
+  const mouse = new THREE.Vector2(
+    ((ev.clientX - rect.left) / rect.width) * 2 - 1,
+    -((ev.clientY - rect.top) / rect.height) * 2 + 1,
+  );
+  raycaster.setFromCamera(mouse, camera);
+  const hit = new THREE.Vector3();
+  if (!raycaster.ray.intersectPlane(placementPlane, hit)) return;
+
+  const [x, y, z] = threeToVicon(hit);
+  if (x < latestRoomMin[0] || x > latestRoomMax[0] ||
+      y < latestRoomMin[1] || y > latestRoomMax[1] ||
+      z < latestRoomMin[2] || z > latestRoomMax[2]) {
+    document.getElementById('custom-target-msg').textContent =
+      `Outside room bounds: (${x.toFixed(2)}, ${y.toFixed(2)}, ${z.toFixed(2)})`;
+    return;
+  }
+
+  fetch('/api/custom_target', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ x, y, z }),
+  })
+    .then((res) => res.json())
+    .then((data) => {
+      document.getElementById('custom-target-msg').textContent = data.message;
+    });
+}
+
 function setRoomBounds(roomMin, roomMax) {
+  latestRoomMin = roomMin;
+  latestRoomMax = roomMax;
+
+  const zSlider = document.getElementById('custom-target-z');
+  if (zSlider && zSlider.dataset.rangeSet !== '1') {
+    zSlider.min = roomMin[2];
+    zSlider.max = roomMax[2];
+    zSlider.value = Math.min(Math.max(1.0, roomMin[2]), roomMax[2]);
+    zSlider.dataset.rangeSet = '1';
+    document.getElementById('custom-target-z-val').textContent = `${parseFloat(zSlider.value).toFixed(2)} m`;
+  }
+
   if (roomBoundsSet) return;
   roomBoundsSet = true;
 
@@ -261,6 +346,22 @@ function updateUI(state) {
     targetMesh.visible = false;
   }
 
+  if (state.aruco_pos) {
+    arucoMesh.visible = true;
+    arucoMesh.position.copy(viconToThree(state.aruco_pos));
+    document.getElementById('s-aruco').textContent = state.aruco_pos.map(v => v.toFixed(2)).join(', ');
+  } else {
+    arucoMesh.visible = false;
+    document.getElementById('s-aruco').textContent = '--';
+  }
+
+  document.getElementById('s-custom-target').textContent =
+    state.custom_target ? state.custom_target.map(v => v.toFixed(2)).join(', ') : '--';
+
+  const customPanel = document.getElementById('custom-target-panel');
+  customPanel.hidden = state.target_mode !== 'custom';
+  document.getElementById('three-container').classList.toggle('placement-mode', state.target_mode === 'custom');
+
   plotLinVel.push(state.lin_vel_b);
   plotAngVel.push(state.ang_vel_b);
   plotRPY.push([state.roll_deg, state.pitch_deg, state.yaw_deg]);
@@ -298,6 +399,14 @@ document.getElementById('params-form').addEventListener('submit', async (e) => {
   });
   const data = await res.json();
   document.getElementById('params-msg').textContent = data.message;
+});
+
+document.getElementById('select-target-mode').addEventListener('change', (e) => {
+  document.getElementById('custom-target-panel').hidden = e.target.value !== 'custom';
+});
+
+document.getElementById('custom-target-z').addEventListener('input', (e) => {
+  document.getElementById('custom-target-z-val').textContent = `${parseFloat(e.target.value).toFixed(2)} m`;
 });
 
 document.getElementById('btn-start').addEventListener('click', () => fetch('/api/start', { method: 'POST' }));
