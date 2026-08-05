@@ -52,11 +52,24 @@ senza accesso diretto al drone):
 OUTPUT: topic 'observations' (std_msgs/Float32MultiArray, 52 elementi,
 stesso ordine ESATTO del vettore obs nel controllore monolitico),
 pubblicato ad ogni tick del timer interno (STEP_DT, 25Hz).
+
+REGISTRAZIONE E PLOT DATI (stesso pattern di tello_test/read_sensors.py):
+ad ogni tick di control_loop() viene salvato in memoria un campione con
+posa/velocita' del drone, target attivo (w0) e wp_idx. Alla chiusura del
+nodo (Ctrl+C o shutdown) i campioni vengono automaticamente:
+  1. Salvati in CSV (cartella data dal parametro 'output_dir').
+  2. Graficati e salvati in PNG (griglia 3x2): traiettoria 3D drone+target
+     +confini stanza, traiettoria XY dall'alto, posizione (drone vs
+     target) nel tempo, yaw (drone vs target) nel tempo, velocita'
+     lineari/angolari nel tempo, norma errore di posizione nel tempo.
 """
 
+import csv
 import math
+import os
 import threading
 import time
+from datetime import datetime
 
 import numpy as np
 import rclpy
@@ -64,6 +77,10 @@ from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, Twist
 from std_msgs.msg import Empty, Float32MultiArray
 from scipy.spatial.transform import Rotation as R
+
+import matplotlib
+matplotlib.use('Agg')  # Backend non interattivo per salvataggio figure senza server X
+import matplotlib.pyplot as plt
 
 # ============================================================
 # CONFIG — deve rispecchiare params/env.yaml del checkpoint (stessi
@@ -132,6 +149,17 @@ def euler_rates_to_body_rates(roll_dot, pitch_dot, yaw_dot, roll, pitch) -> np.n
 class ObservationHandler(Node):
     def __init__(self):
         super().__init__("observation_handler")
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.declare_parameter("output_dir", script_dir)
+        self.declare_parameter("save_csv", True)
+        self.declare_parameter("save_plot", True)
+        self.output_dir = self.get_parameter("output_dir").get_parameter_value().string_value
+        self.save_csv_flag = self.get_parameter("save_csv").get_parameter_value().bool_value
+        self.save_plot_flag = self.get_parameter("save_plot").get_parameter_value().bool_value
+        self.start_time = time.time()
+        self._history_lock = threading.Lock()
+        self.history = []
 
         self.declare_parameter("dof_mask_mode", "full")
         dof_mask_mode = self.get_parameter("dof_mask_mode").get_parameter_value().string_value
@@ -374,6 +402,168 @@ class ObservationHandler(Node):
         msg.data = obs.tolist()
         self.obs_pub.publish(msg)
 
+        with self._history_lock:
+            self.history.append({
+                "time": time.time() - self.start_time,
+                "x": pos_env[0], "y": pos_env[1], "z": pos_env[2],
+                "yaw_deg": math.degrees(yaw),
+                "wp_idx": wp_idx,
+                "target_x": w0_pos[0], "target_y": w0_pos[1], "target_z": w0_pos[2],
+                "target_yaw_deg": math.degrees(w0_yaw),
+                "lin_vel_b_x": self.lin_vel_b[0],
+                "lin_vel_b_y": self.lin_vel_b[1],
+                "lin_vel_b_z": self.lin_vel_b[2],
+                "ang_vel_b_x": self.ang_vel_b[0],
+                "ang_vel_b_y": self.ang_vel_b[1],
+                "ang_vel_b_z": self.ang_vel_b[2],
+                "pos_err_norm": float(np.linalg.norm(pos_err)),
+            })
+
+
+    # -------------------- salvataggio CSV e grafico PLOT --------------------
+    def save_data_and_plots(self):
+        with self._history_lock:
+            data = list(self.history)
+
+        if not data:
+            self.get_logger().warn("Nessun dato registrato durante la sessione, skip salvataggio.")
+            return
+
+        self.get_logger().info("Avvio salvataggio dati e generazione grafici...")
+        os.makedirs(self.output_dir, exist_ok=True)
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        if self.save_csv_flag:
+            csv_path = os.path.join(self.output_dir, f"observation_log_{timestamp_str}.csv")
+            try:
+                with open(csv_path, "w", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=data[0].keys())
+                    writer.writeheader()
+                    writer.writerows(data)
+                self.get_logger().info(f"Dati salvati in: {csv_path}")
+            except Exception as e:
+                self.get_logger().error(f"Errore salvataggio CSV: {e}")
+
+        if self.save_plot_flag:
+            plot_png = os.path.join(self.output_dir, f"observation_plots_{timestamp_str}.png")
+            try:
+                t = [d["time"] for d in data]
+                x = [d["x"] for d in data]
+                y = [d["y"] for d in data]
+                z = [d["z"] for d in data]
+                tx = [d["target_x"] for d in data]
+                ty = [d["target_y"] for d in data]
+                tz = [d["target_z"] for d in data]
+
+                fig = plt.figure(figsize=(16, 20))
+                fig.suptitle(
+                    f"Observation Handler — Pose/Target/Velocity Overview ({timestamp_str})",
+                    fontsize=16, fontweight="bold",
+                )
+
+                # 1: traiettoria 3D drone + target + confini stanza
+                ax1 = fig.add_subplot(3, 2, 1, projection="3d")
+                ax1.plot(x, y, z, label="Drone path", color="purple")
+                ax1.scatter(x[0], y[0], z[0], color="green", s=40, label="Start")
+                ax1.scatter(x[-1], y[-1], z[-1], color="red", s=40, label="End")
+                ax1.plot(tx, ty, tz, label="Target path", color="orange", linestyle="--", linewidth=1)
+                rmin, rmax = ROOM_MIN, ROOM_MAX
+                for s, e in (
+                    ((rmin[0], rmin[1], rmin[2]), (rmax[0], rmin[1], rmin[2])),
+                    ((rmin[0], rmax[1], rmin[2]), (rmax[0], rmax[1], rmin[2])),
+                    ((rmin[0], rmin[1], rmax[2]), (rmax[0], rmin[1], rmax[2])),
+                    ((rmin[0], rmax[1], rmax[2]), (rmax[0], rmax[1], rmax[2])),
+                    ((rmin[0], rmin[1], rmin[2]), (rmin[0], rmax[1], rmin[2])),
+                    ((rmax[0], rmin[1], rmin[2]), (rmax[0], rmax[1], rmin[2])),
+                    ((rmin[0], rmin[1], rmax[2]), (rmin[0], rmax[1], rmax[2])),
+                    ((rmax[0], rmin[1], rmax[2]), (rmax[0], rmax[1], rmax[2])),
+                    ((rmin[0], rmin[1], rmin[2]), (rmin[0], rmin[1], rmax[2])),
+                    ((rmax[0], rmin[1], rmin[2]), (rmax[0], rmin[1], rmax[2])),
+                    ((rmin[0], rmax[1], rmin[2]), (rmin[0], rmax[1], rmax[2])),
+                    ((rmax[0], rmax[1], rmin[2]), (rmax[0], rmax[1], rmax[2])),
+                ):
+                    ax1.plot(*zip(s, e), color="grey", linewidth=0.6, alpha=0.5)
+                ax1.set_xlabel("X (m)")
+                ax1.set_ylabel("Y (m)")
+                ax1.set_zlabel("Z (m)")
+                ax1.set_title("3D Trajectory (drone vs target, room bounds)")
+                ax1.legend(fontsize=8)
+
+                # 2: traiettoria XY dall'alto, con rettangolo stanza
+                ax2 = fig.add_subplot(3, 2, 2)
+                ax2.plot(x, y, label="Drone XY", color="purple")
+                ax2.plot(tx, ty, label="Target XY", color="orange", linestyle="--")
+                ax2.scatter(x[0], y[0], color="green", s=40, label="Start")
+                ax2.scatter(x[-1], y[-1], color="red", s=40, label="End")
+                ax2.add_patch(plt.Rectangle(
+                    (rmin[0], rmin[1]), rmax[0] - rmin[0], rmax[1] - rmin[1],
+                    fill=False, edgecolor="grey", linestyle=":", label="Room bounds",
+                ))
+                ax2.set_xlabel("X (m)")
+                ax2.set_ylabel("Y (m)")
+                ax2.set_title("Top-down Trajectory in Room (XY)")
+                ax2.set_aspect("equal", adjustable="box")
+                ax2.grid(True)
+                ax2.legend(fontsize=8)
+
+                # 3: posizione drone vs target nel tempo
+                ax3 = fig.add_subplot(3, 2, 3)
+                ax3.plot(t, x, label="Drone X", color="r")
+                ax3.plot(t, y, label="Drone Y", color="g")
+                ax3.plot(t, z, label="Drone Z", color="b")
+                ax3.plot(t, tx, label="Target X", color="r", linestyle=":")
+                ax3.plot(t, ty, label="Target Y", color="g", linestyle=":")
+                ax3.plot(t, tz, label="Target Z", color="b", linestyle=":")
+                ax3.set_xlabel("Time (s)")
+                ax3.set_ylabel("Position (m)")
+                ax3.set_title("Position: Drone vs Target")
+                ax3.grid(True)
+                ax3.legend(fontsize=8)
+
+                # 4: yaw drone vs target + norma errore posizione
+                ax4 = fig.add_subplot(3, 2, 4)
+                ax4.plot(t, [d["yaw_deg"] for d in data], label="Drone yaw (deg)", color="b")
+                ax4.plot(t, [d["target_yaw_deg"] for d in data], label="Target yaw (deg)", color="b", linestyle=":")
+                ax4b = ax4.twinx()
+                ax4b.plot(t, [d["pos_err_norm"] for d in data], label="Pos error norm (m)", color="darkred", alpha=0.7)
+                ax4.set_xlabel("Time (s)")
+                ax4.set_ylabel("Yaw (deg)")
+                ax4b.set_ylabel("Pos error norm (m)")
+                ax4.set_title("Yaw (drone vs target) & Position Error Norm")
+                ax4.grid(True)
+                lines1, labels1 = ax4.get_legend_handles_labels()
+                lines2, labels2 = ax4b.get_legend_handles_labels()
+                ax4.legend(lines1 + lines2, labels1 + labels2, fontsize=8)
+
+                # 5: velocita' lineari nel corpo
+                ax5 = fig.add_subplot(3, 2, 5)
+                ax5.plot(t, [d["lin_vel_b_x"] for d in data], label="vx (m/s)", color="r")
+                ax5.plot(t, [d["lin_vel_b_y"] for d in data], label="vy (m/s)", color="g")
+                ax5.plot(t, [d["lin_vel_b_z"] for d in data], label="vz (m/s)", color="b")
+                ax5.set_xlabel("Time (s)")
+                ax5.set_ylabel("Linear vel body (m/s)")
+                ax5.set_title("Linear Velocity (body frame)")
+                ax5.grid(True)
+                ax5.legend(fontsize=8)
+
+                # 6: velocita' angolari nel corpo
+                ax6 = fig.add_subplot(3, 2, 6)
+                ax6.plot(t, [d["ang_vel_b_x"] for d in data], label="wx (rad/s)", color="darkred")
+                ax6.plot(t, [d["ang_vel_b_y"] for d in data], label="wy (rad/s)", color="darkgreen")
+                ax6.plot(t, [d["ang_vel_b_z"] for d in data], label="wz (rad/s)", color="darkblue")
+                ax6.set_xlabel("Time (s)")
+                ax6.set_ylabel("Angular vel body (rad/s)")
+                ax6.set_title("Angular Velocity (body frame)")
+                ax6.grid(True)
+                ax6.legend(fontsize=8)
+
+                plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+                plt.savefig(plot_png, dpi=200)
+                plt.close(fig)
+                self.get_logger().info(f"Grafici salvati in: {plot_png}")
+            except Exception as e:
+                self.get_logger().error(f"Errore durante il plot dei grafici: {e}")
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -383,6 +573,7 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        node.save_data_and_plots()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
