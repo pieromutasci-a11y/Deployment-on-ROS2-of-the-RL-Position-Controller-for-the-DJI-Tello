@@ -60,8 +60,8 @@ from djitellopy import Tello as DJITello
 # CONFIG — stessi valori usati in position_controller_VICON_VERSION.py
 # ============================================================
 VEL_REF_SCALE = np.array([1.0, 1.0, 1.0, 1.5])   # [vx,vy,vz,wz]: target_lin_vel_*_scale/target_yaw_vel_scale
-MAX_LIN_VEL_MPS = 0.8
-MAX_YAW_RATE_RADPS = 1.0
+MAX_LIN_VEL_MPS = 0.1
+MAX_YAW_RATE_RADPS = 0.15
 
 ACTION_TIMEOUT_S = 0.2             # 5 cicli @25Hz: oltre questo, hover forzato
 

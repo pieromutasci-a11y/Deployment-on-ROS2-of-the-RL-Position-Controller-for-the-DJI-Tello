@@ -40,7 +40,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from std_msgs.msg import Float32MultiArray
 
-STEP_DT = 0.04                     # 25 Hz
+STEP_DT = 0.01                     # 25 Hz
 OBS_SIZE = 52
 ACTION_SIZE = 4
 

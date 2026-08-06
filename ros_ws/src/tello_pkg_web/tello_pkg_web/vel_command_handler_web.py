@@ -99,8 +99,8 @@ from tello_pkg.observation_handler import (
 # CONFIG — stessi valori usati in tello_pkg/vel_command_handler.py
 # ============================================================
 VEL_REF_SCALE = np.array([1.0, 1.0, 1.0, 1.5])   # [vx,vy,vz,wz]
-MAX_LIN_VEL_MPS = 0.8
-MAX_YAW_RATE_RADPS = 1.0
+MAX_LIN_VEL_MPS = 0.15
+MAX_YAW_RATE_RADPS = 0.18
 
 ACTION_TIMEOUT_S = 0.2
 

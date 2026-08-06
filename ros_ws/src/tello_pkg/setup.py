@@ -31,7 +31,7 @@ setup(
             'policy_handler=tello_pkg.policy_handler:main',
             'target_handler=tello_pkg.target_handler:main',
             'vel_command_handler=tello_pkg.vel_command_handler:main',
-            'mission_console=tello_pkg.mission_console:main',
+            'mission_console=tello_pkg.mission_console:main'
         ],
     },
 )

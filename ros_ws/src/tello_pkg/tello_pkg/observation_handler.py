@@ -86,7 +86,7 @@ import matplotlib.pyplot as plt
 # CONFIG — deve rispecchiare params/env.yaml del checkpoint (stessi
 # valori usati in position_controller_VICON_VERSION.py / target_handler.py).
 # ============================================================
-STEP_DT = 0.04                     # 25 Hz
+STEP_DT = 0.005                     # 25 Hz
 N_WAYPOINTS = 4
 WP_PREVIEW_HORIZON = 4
 INTEGRAL_TAU_S = 5.0

@@ -103,6 +103,7 @@ TARGET_HOLD_TIME_S = 1.2
 
 VICON_POSE_TOPIC = "/vicon/tello_42_boosted/tello_42_boosted"
 ARUCO_POSE_TOPIC = "/vicon/aruco42/aruco42"
+ARUCO_TARGET_Z_OFFSET_M = 0.0
 FLIGHT_STATE_TOPIC = "/tello/flight_state"
 LAND_REQUEST_TOPIC = "/tello/land_request"
 TARGETS_TOPIC = "targets"
@@ -267,6 +268,7 @@ class TargetHandler(Node):
             pos = self._last_aruco_pos if self._last_aruco_pos is not None else (
                 self._pos_env if self._pos_env is not None else np.zeros(3)
             )
+            pos = pos + np.array([0.0, 0.0, ARUCO_TARGET_Z_OFFSET_M])
             for k in range(N_WAYPOINTS):
                 self.wp_pos_queue[k] = pos
                 self.wp_yaw_queue[k] = 0.0
