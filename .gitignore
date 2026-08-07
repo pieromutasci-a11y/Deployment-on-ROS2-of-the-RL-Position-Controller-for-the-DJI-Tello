@@ -7,3 +7,6 @@ ros_ws/log/
 __pycache__/
 *.pyc
 *.egg-info/
+
+# Output sessione (CSV/PNG salvati da observation_handler e vel_command_handler_web)
+ros_ws/Results/

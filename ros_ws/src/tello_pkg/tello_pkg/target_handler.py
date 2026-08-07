@@ -93,15 +93,16 @@ from std_msgs.msg import Bool, Empty, Float32MultiArray
 STEP_DT = 0.04                     # 25 Hz, stessa frequenza del loop di controllo HL
 N_WAYPOINTS = 4                    # env.yaml: n_waypoints
 
-ROOM_MIN = np.array([-2.0, -1.5, 0.1])
-ROOM_MAX = np.array([2.0, 1.5, 2.0])
+ROOM_MIN = np.array([-1.8, -1.5, 0.1])
+ROOM_MAX = np.array([1.8, 1.5, 1.5])
 TARGET_ROOM_MARGIN = 0.8           # env.yaml: target_room_margin
 
 TARGET_REACH_THRESHOLD_M = 0.15
 TARGET_REACH_YAW_THRESHOLD_RAD = 0.20
 TARGET_HOLD_TIME_S = 1.2
 
-VICON_POSE_TOPIC = "/vicon/tello_42_boosted/tello_42_boosted"
+# VICON_POSE_TOPIC = "/vicon/tello_42_boosted/tello_42_boosted"
+VICON_POSE_TOPIC = "/vicon/Tello_2/Tello_2"
 ARUCO_POSE_TOPIC = "/vicon/aruco42/aruco42"
 ARUCO_TARGET_Z_OFFSET_M = 0.0
 FLIGHT_STATE_TOPIC = "/tello/flight_state"

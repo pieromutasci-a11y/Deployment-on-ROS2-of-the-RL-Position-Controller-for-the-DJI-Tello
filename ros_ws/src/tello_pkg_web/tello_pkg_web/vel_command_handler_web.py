@@ -93,6 +93,7 @@ from tello_pkg.target_handler import (
 from tello_pkg.observation_handler import (
     DOF_MASKS,
     wrap_to_pi, compute_projected_gravity_b, compute_lin_vel_body, euler_rates_to_body_rates,
+    _find_ros_ws_root,
 )
 
 # ============================================================
@@ -148,15 +149,19 @@ class VelCommandHandlerWeb(Node):
         self.declare_parameter("enable_terminal_input", True)
         self.enable_terminal_input = self.get_parameter("enable_terminal_input").get_parameter_value().bool_value
 
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        self.declare_parameter("output_dir", script_dir)
+        # ros_ws/src/tello_pkg_web/tello_pkg_web/ -> risali di 3 livelli fino a ros_ws/
+        # stessa cartella di observation_handler: quello resta l'UNICA fonte di
+        # verita' per pose/target/velocita' (niente CSV Vicon duplicato qui, vedi
+        # save_data_and_plots).
+        ros_ws_dir = _find_ros_ws_root(os.path.dirname(os.path.abspath(__file__)))
+        default_output_dir = os.path.join(ros_ws_dir, "Results")
+        self.declare_parameter("output_dir", default_output_dir)
         self.declare_parameter("save_csv", True)
         self.declare_parameter("save_plot", True)
         self.output_dir = self.get_parameter("output_dir").get_parameter_value().string_value
         self.save_csv_flag = self.get_parameter("save_csv").get_parameter_value().bool_value
         self.save_plot_flag = self.get_parameter("save_plot").get_parameter_value().bool_value
         self.start_time = time.time()
-        self.vicon_history = []
         self.flight_history = []
 
         # ---------------- attuazione djitellopy (da vel_command_handler.py) ----------------
@@ -177,7 +182,13 @@ class VelCommandHandlerWeb(Node):
         self.last_state_change_time = None
         self._state_warned = False
 
-        self.drone = DJITello()
+        # IP del drone: default 192.168.10.1 (Tello in AP mode, PC connesso
+        # alla sua rete WiFi). Override via --ros-args -p tello_ip:=... se il
+        # drone e' invece in station mode (join di una rete esistente), dove
+        # l'IP e' assegnato dal router e non e' quello di fabbrica.
+        self.declare_parameter("tello_ip", "192.168.16.196")
+        tello_ip = self.get_parameter("tello_ip").get_parameter_value().string_value
+        self.drone = DJITello(host=tello_ip)
 
         self.action_sub = self.create_subscription(Twist, POLICY_ACTION_TOPIC, self.policy_action_cb, 10)
         self.land_request_sub = self.create_subscription(Empty, LAND_REQUEST_TOPIC, self.land_request_cb, 10)
@@ -351,7 +362,9 @@ class VelCommandHandlerWeb(Node):
         with self._tello_lock:
             self.battery_pct = battery
             self.tello_alt_cm = height_cm
-            if state:
+            # logging CSV/plot SOLO durante il volo (flight_ready), sincronizzato
+            # con observation_handler: niente dati pre/post-volo nel file.
+            if state and self.flight_ready:
                 t_rel = time.time() - self.start_time
                 self.flight_history.append({
                     "time": t_rel, "battery": battery, "height_cm": height_cm,
@@ -391,6 +404,12 @@ class VelCommandHandlerWeb(Node):
 
         self._landing_started = False
         self.flight_ready = True
+        # sincronizza il logging con observation_handler (che si aggancia allo
+        # stesso evento via FLIGHT_STATE_TOPIC): t=0 al decollo, niente dati
+        # pre-volo nel CSV.
+        self.start_time = time.time()
+        with self._tello_lock:
+            self.flight_history = []
         self._publish_flight_state()
 
         deadline = time.monotonic() + TAKEOFF_CONFIRM_TIMEOUT_S
@@ -451,6 +470,17 @@ class VelCommandHandlerWeb(Node):
                 self.drone.send_command_without_return("land")
             except Exception:
                 pass
+
+        # Salvo SUBITO il CSV/plot di questa sessione di volo (timestamp dedicato,
+        # un file per volo, sincronizzato con observation_handler) e svuoto lo
+        # storico: una nuova sessione (magari con parametri diversi) non si
+        # somma/sovrascrive a quella appena chiusa.
+        try:
+            self.save_data_and_plots()
+        except Exception as e:
+            self.get_logger().error(f"Errore durante il salvataggio dati a fine volo: {e}")
+        with self._tello_lock:
+            self.flight_history = []
 
         self._landing_started = False  # pronto per un nuovo volo, connessione resta viva
 
@@ -519,7 +549,11 @@ class VelCommandHandlerWeb(Node):
         ok_tm = self.set_remote_param(self.target_handler_client, "target_handler", "target_mode", target_mode)
         ok_am = self.set_remote_param(self.target_handler_client, "target_handler", "advance_mode", advance_mode)
         ok_nq = self.set_remote_param(self.target_handler_client, "target_handler", "num_queues", num_queues)
-        if not (ok_dof and ok_tm and ok_am and ok_nq):
+        # Rispecchiati anche su observation_handler (solo informativi la',
+        # servono per nominare i CSV/plot di quella sessione).
+        ok_tm_obs = self.set_remote_param(self.observation_handler_client, "observation_handler", "target_mode", target_mode)
+        ok_am_obs = self.set_remote_param(self.observation_handler_client, "observation_handler", "advance_mode", advance_mode)
+        if not (ok_dof and ok_tm and ok_am and ok_nq and ok_tm_obs and ok_am_obs):
             return False, "Uno o piu' parametri non sono stati applicati (vedi log del nodo)."
 
         with self._params_lock:
@@ -627,17 +661,6 @@ class VelCommandHandlerWeb(Node):
         self.pose_received = True
         self.last_pose_wall_time = time.monotonic()
 
-        t_rel = time.time() - self.start_time
-        self.vicon_history.append({
-            "time": t_rel,
-            "x": p_world[0], "y": p_world[1], "z": p_world[2],
-            "qx": q.x, "qy": q.y, "qz": q.z, "qw": q.w,
-            "roll_deg": math.degrees(roll), "pitch_deg": math.degrees(pitch), "yaw_deg": math.degrees(yaw),
-            "proj_grav_x": self.proj_grav_b[0], "proj_grav_y": self.proj_grav_b[1], "proj_grav_z": self.proj_grav_b[2],
-            "lin_vel_b_x": self.lin_vel_b[0], "lin_vel_b_y": self.lin_vel_b[1], "lin_vel_b_z": self.lin_vel_b[2],
-            "ang_vel_b_x": self.ang_vel_b[0], "ang_vel_b_y": self.ang_vel_b[1], "ang_vel_b_z": self.ang_vel_b[2],
-        })
-
     def aruco_cb(self, msg: PoseStamped):
         """Aggiorna SEMPRE self.last_aruco_pos, indipendentemente dal
         target_mode attivo: serve solo a far vedere il marker muoversi
@@ -655,142 +678,60 @@ class VelCommandHandlerWeb(Node):
         self.get_logger().info("Avvio salvataggio dati e generazione grafici...")
         os.makedirs(self.output_dir, exist_ok=True)
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        with self._params_lock:
+            run_tag = f"{self.target_mode}_{self.advance_mode}"
 
-        vicon_data = list(self.vicon_history)
         with self._tello_lock:
             flight_data = list(self.flight_history)
 
-        if len(vicon_data) + len(flight_data) == 0:
+        if not flight_data:
             self.get_logger().warn("Nessun dato registrato durante la sessione, skip salvataggio.")
             return
 
+        # Pose/target/velocita' (Vicon) sono gia' registrati da observation_handler
+        # (observation_log_*.csv nella stessa cartella Results): qui si salva SOLO la
+        # telemetria che arriva unicamente da questo nodo via djitellopy (batteria,
+        # stato volo, letture SDK raw), per evitare CSV/plot duplicati.
         if self.save_csv_flag:
-            if vicon_data:
-                vicon_csv = os.path.join(self.output_dir, f"sensor_vicon_{timestamp_str}.csv")
-                try:
-                    with open(vicon_csv, "w", newline="") as f:
-                        writer = csv.DictWriter(f, fieldnames=vicon_data[0].keys())
-                        writer.writeheader()
-                        writer.writerows(vicon_data)
-                    self.get_logger().info(f"Dati Vicon salvati in: {vicon_csv}")
-                except Exception as e:
-                    self.get_logger().error(f"Errore salvataggio Vicon CSV: {e}")
-            if flight_data:
-                flight_csv = os.path.join(self.output_dir, f"sensor_tello_flight_{timestamp_str}.csv")
-                try:
-                    with open(flight_csv, "w", newline="") as f:
-                        writer = csv.DictWriter(f, fieldnames=flight_data[0].keys())
-                        writer.writeheader()
-                        writer.writerows(flight_data)
-                    self.get_logger().info(f"Dati Tello Flight salvati in: {flight_csv}")
-                except Exception as e:
-                    self.get_logger().error(f"Errore salvataggio Tello Flight CSV: {e}")
+            flight_csv = os.path.join(self.output_dir, f"sensor_tello_flight_{run_tag}_{timestamp_str}.csv")
+            try:
+                with open(flight_csv, "w", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=flight_data[0].keys())
+                    writer.writeheader()
+                    writer.writerows(flight_data)
+                self.get_logger().info(f"Dati Tello Flight salvati in: {flight_csv}")
+            except Exception as e:
+                self.get_logger().error(f"Errore salvataggio Tello Flight CSV: {e}")
 
         if self.save_plot_flag:
-            plot_png = os.path.join(self.output_dir, f"sensor_plots_{timestamp_str}.png")
+            plot_png = os.path.join(self.output_dir, f"sensor_plots_{run_tag}_{timestamp_str}.png")
             try:
-                fig = plt.figure(figsize=(16, 18))
-                fig.suptitle(f"Sensor Data Overview ({timestamp_str})", fontsize=16, fontweight='bold')
+                fig = plt.figure(figsize=(12, 8))
+                fig.suptitle(f"Tello Flight Telemetry ({timestamp_str})", fontsize=16, fontweight='bold')
 
-                ax1 = fig.add_subplot(4, 2, 1)
-                if vicon_data:
-                    t_vicon = [d["time"] for d in vicon_data]
-                    ax1.plot(t_vicon, [d["x"] for d in vicon_data], label="Pos X (m)", color="r")
-                    ax1.plot(t_vicon, [d["y"] for d in vicon_data], label="Pos Y (m)", color="g")
-                    ax1.plot(t_vicon, [d["z"] for d in vicon_data], label="Pos Z (m)", color="b")
-                    ax1.set_xlabel("Time (s)"); ax1.set_ylabel("Position (m)")
-                    ax1.set_title("Vicon Position"); ax1.grid(True); ax1.legend()
-                else:
-                    ax1.set_title("Vicon Position (No Data)")
+                t_fl = [d["time"] for d in flight_data]
 
-                ax2 = fig.add_subplot(4, 2, 2, projection='3d')
-                if vicon_data:
-                    x_v = [d["x"] for d in vicon_data]; y_v = [d["y"] for d in vicon_data]; z_v = [d["z"] for d in vicon_data]
-                    ax2.plot(x_v, y_v, z_v, label="3D Path", color="purple")
-                    ax2.scatter(x_v[0], y_v[0], z_v[0], color="green", s=40, label="Start")
-                    ax2.scatter(x_v[-1], y_v[-1], z_v[-1], color="red", s=40, label="End")
-                    ax2.set_xlabel("X (m)"); ax2.set_ylabel("Y (m)"); ax2.set_zlabel("Z (m)")
-                    ax2.set_title("Vicon 3D Trajectory"); ax2.legend()
-                else:
-                    ax2.set_title("Vicon 3D Trajectory (No Data)")
+                ax1 = fig.add_subplot(2, 1, 1)
+                if any(d["battery"] is not None for d in flight_data):
+                    ax1.plot(t_fl, [d["battery"] for d in flight_data], label="Battery (%)", color="orange")
+                if any(d["height_cm"] is not None for d in flight_data):
+                    h_vals = [d["height_cm"] / 100.0 if d["height_cm"] is not None else None for d in flight_data]
+                    ax1.plot(t_fl, h_vals, label="Height SDK (m)", color="teal")
+                ax1.set_xlabel("Time (s)"); ax1.set_ylabel("Value")
+                ax1.set_title("Battery & Height (SDK)"); ax1.grid(True); ax1.legend()
 
-                ax3 = fig.add_subplot(4, 2, 3)
-                if vicon_data:
-                    t_vicon = [d["time"] for d in vicon_data]
-                    ax3.plot(t_vicon, [d["roll_deg"] for d in vicon_data], label="Roll (deg)", color="r")
-                    ax3.plot(t_vicon, [d["pitch_deg"] for d in vicon_data], label="Pitch (deg)", color="g")
-                    ax3.plot(t_vicon, [d["yaw_deg"] for d in vicon_data], label="Yaw (deg)", color="b")
-                    ax3.set_xlabel("Time (s)"); ax3.set_ylabel("Angle (deg)")
-                    ax3.set_title("Vicon Euler Angles"); ax3.grid(True); ax3.legend()
-                else:
-                    ax3.set_title("Vicon Euler Angles (No Data)")
-
-                ax4 = fig.add_subplot(4, 2, 4)
-                if vicon_data:
-                    t_vicon = [d["time"] for d in vicon_data]
-                    ax4.plot(t_vicon, [d["proj_grav_x"] for d in vicon_data], label="Proj Grav X", color="m")
-                    ax4.plot(t_vicon, [d["proj_grav_y"] for d in vicon_data], label="Proj Grav Y", color="c")
-                    ax4.plot(t_vicon, [d["proj_grav_z"] for d in vicon_data], label="Proj Grav Z", color="y")
-                    ax4.axhline(-1.0, color="grey", linestyle="--", linewidth=0.8, label="atteso Z=-1")
-                    ax4.set_xlabel("Time (s)"); ax4.set_ylabel("Gravity (body frame)")
-                    ax4.set_title("Projected Gravity Body"); ax4.grid(True); ax4.legend(fontsize=8)
-                else:
-                    ax4.set_title("Projected Gravity Body (No Data)")
-
-                ax5 = fig.add_subplot(4, 2, 5)
-                if vicon_data:
-                    t_vicon = [d["time"] for d in vicon_data]
-                    ax5.plot(t_vicon, [d["lin_vel_b_x"] for d in vicon_data], label="LinVel X (m/s)", color="r")
-                    ax5.plot(t_vicon, [d["lin_vel_b_y"] for d in vicon_data], label="LinVel Y (m/s)", color="g")
-                    ax5.plot(t_vicon, [d["lin_vel_b_z"] for d in vicon_data], label="LinVel Z (m/s)", color="b")
-                if flight_data and any(d.get("vgx") is not None for d in flight_data):
-                    t_fl = [d["time"] for d in flight_data]
-                    ax5.plot(t_fl, [d["vgx"] for d in flight_data], label="SDK vgx (raw)", color="r", linestyle=":")
-                    ax5.plot(t_fl, [d["vgy"] for d in flight_data], label="SDK vgy (raw)", color="g", linestyle=":")
-                    ax5.plot(t_fl, [d["vgz"] for d in flight_data], label="SDK vgz (raw)", color="b", linestyle=":")
-                ax5.set_xlabel("Time (s)"); ax5.set_ylabel("Vel (m/s | raw SDK)")
-                ax5.set_title("Linear Velocity (Vicon body vs SDK vg raw)"); ax5.grid(True); ax5.legend(fontsize=8)
-
-                ax6 = fig.add_subplot(4, 2, 6)
-                if vicon_data:
-                    t_vicon = [d["time"] for d in vicon_data]
-                    ax6.plot(t_vicon, [d["ang_vel_b_x"] for d in vicon_data], label="wx", color="darkred")
-                    ax6.plot(t_vicon, [d["ang_vel_b_y"] for d in vicon_data], label="wy", color="darkgreen")
-                    ax6.plot(t_vicon, [d["ang_vel_b_z"] for d in vicon_data], label="wz", color="darkblue")
-                    ax6.axhline(0.0, color="grey", linestyle="--", linewidth=0.8)
-                    ax6.set_xlabel("Time (s)"); ax6.set_ylabel("Ang vel (rad/s)")
-                    ax6.set_title("Body Angular Velocity ang_vel_b"); ax6.grid(True); ax6.legend(fontsize=8)
-                else:
-                    ax6.set_title("Body Angular Velocity (No Data)")
-
-                ax7 = fig.add_subplot(4, 2, 7)
-                if vicon_data:
-                    for key, lab, col in (("ang_vel_b_x", "wx", "darkred"), ("ang_vel_b_y", "wy", "darkgreen"), ("ang_vel_b_z", "wz", "darkblue")):
-                        ax7.hist([d[key] for d in vicon_data], bins=60, alpha=0.5, label=lab, color=col)
-                    ax7.set_xlabel("Ang vel (rad/s)"); ax7.set_ylabel("Occorrenze")
-                    ax7.set_title("ang_vel_b distribution"); ax7.grid(True); ax7.legend(fontsize=8)
-                else:
-                    ax7.set_title("ang_vel_b distribution (No Data)")
-
-                ax8 = fig.add_subplot(4, 2, 8)
-                if flight_data:
-                    t_fl = [d["time"] for d in flight_data]
-                    if any(d["battery"] is not None for d in flight_data):
-                        ax8.plot(t_fl, [d["battery"] for d in flight_data], label="Battery (%)", color="orange")
-                    if any(d["height_cm"] is not None for d in flight_data):
-                        h_vals = [d["height_cm"] / 100.0 if d["height_cm"] is not None else None for d in flight_data]
-                        ax8.plot(t_fl, h_vals, label="Height SDK (m)", color="teal")
-                    if vicon_data:
-                        ax8.plot([d["time"] for d in vicon_data], [d["z"] for d in vicon_data], label="Height Vicon Z (m)", color="purple", linestyle="--")
-                    ax8.set_xlabel("Time (s)"); ax8.set_ylabel("Value")
-                    ax8.set_title("Tello State (Battery & Height)"); ax8.grid(True); ax8.legend(fontsize=8)
-                else:
-                    ax8.set_title("Tello State (No Data)")
+                ax2 = fig.add_subplot(2, 1, 2)
+                if any(d.get("vgx") is not None for d in flight_data):
+                    ax2.plot(t_fl, [d["vgx"] for d in flight_data], label="SDK vgx (raw)", color="r")
+                    ax2.plot(t_fl, [d["vgy"] for d in flight_data], label="SDK vgy (raw)", color="g")
+                    ax2.plot(t_fl, [d["vgz"] for d in flight_data], label="SDK vgz (raw)", color="b")
+                ax2.set_xlabel("Time (s)"); ax2.set_ylabel("Vel (raw SDK)")
+                ax2.set_title("SDK Raw Velocity"); ax2.grid(True); ax2.legend()
 
                 plt.tight_layout(rect=[0, 0.03, 1, 0.95])
                 plt.savefig(plot_png, dpi=200)
                 plt.close(fig)
-                self.get_logger().info(f"Grafici dei sensori salvati in: {plot_png}")
+                self.get_logger().info(f"Grafici telemetria volo salvati in: {plot_png}")
             except Exception as e:
                 self.get_logger().error(f"Errore durante il plot dei grafici: {e}")
 
@@ -802,6 +743,7 @@ class VelCommandHandlerWeb(Node):
             wp_idx = self.wp_idx
             queues_completed = self.queues_completed
             target = self.wp_pos_queue[wp_idx].tolist() if self.targets_received else None
+            target_yaw_deg = math.degrees(float(self.wp_yaw_queue[wp_idx])) if self.targets_received else None
 
         with self._tello_lock:
             battery = self.battery_pct
@@ -829,6 +771,7 @@ class VelCommandHandlerWeb(Node):
             "lin_vel_b": self.lin_vel_b.tolist(),
             "ang_vel_b": self.ang_vel_b.tolist(),
             "target": target if self.flight_ready else None,
+            "target_yaw_deg": target_yaw_deg if self.flight_ready else None,
             "aruco_pos": self.last_aruco_pos,
             "custom_target": custom_target,
             "room_min": ROOM_MIN.tolist(),

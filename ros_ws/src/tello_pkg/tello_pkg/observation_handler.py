@@ -74,8 +74,9 @@ from datetime import datetime
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoSHistoryPolicy
 from geometry_msgs.msg import PoseStamped, Twist
-from std_msgs.msg import Empty, Float32MultiArray
+from std_msgs.msg import Bool, Empty, Float32MultiArray
 from scipy.spatial.transform import Rotation as R
 
 import matplotlib
@@ -93,18 +94,29 @@ INTEGRAL_TAU_S = 5.0
 INTEGRAL_CLAMP = 1.0
 INTEGRAL_OBS_SCALE = 0.5
 
-ROOM_MIN = np.array([-2.0, -1.5, 0.1])
-ROOM_MAX = np.array([2.0, 1.5, 2.0])
+ROOM_MIN = np.array([-1.8, -1.5, 0.1])
+ROOM_MAX = np.array([1.8, 1.5, 1.5])
+    
+# Stessi valori di tello_pkg/vel_command_handler.py: servono SOLO per calcolare,
+# a scopo di logging CSV, la velocita' di riferimento comandata al drone
+# (azione policy scalata+clippata), da confrontare con lin_vel_b/ang_vel_b
+# misurate. NON alimentano alcuna azione qui, e non vanno tenute fuori sync
+# rispetto a vel_command_handler.py / vel_command_handler_web.py.
+VEL_REF_SCALE = np.array([1.0, 1.0, 1.0, 1.5])   # [vx,vy,vz,wz]
+MAX_LIN_VEL_MPS = 0.1
+MAX_YAW_RATE_RADPS = 0.15
 
 DOF_MASKS = {
     "full":     (1.0, 1.0, 1.0, 1.0),
     "uniciclo": (1.0, 0.0, 1.0, 1.0),
 }
 
-VICON_POSE_TOPIC = "/vicon/tello_42_boosted/tello_42_boosted"
+# VICON_POSE_TOPIC = "/vicon/tello_42_boosted/tello_42_boosted"
+VICON_POSE_TOPIC = "/vicon/Tello_2/Tello_2"
 TARGETS_TOPIC = "targets"
 POLICY_ACTION_TOPIC = "/tello/policy_action"
 LAND_REQUEST_TOPIC = "/tello/land_request"
+FLIGHT_STATE_TOPIC = "/tello/flight_state"
 OBSERVATIONS_TOPIC = "observations"
 
 POSE_TIMEOUT_S = 0.5
@@ -114,6 +126,26 @@ MAX_PLAUSIBLE_SPEED_MPS = 5.0
 MAX_PLAUSIBLE_ANG_SPEED_RADPS = 20.0
 MIN_QUAT_NORM = 0.9
 MAX_QUAT_NORM = 1.1
+
+
+def _find_ros_ws_root(start_path):
+    """Risale da start_path fino a trovare ros_ws/ (riconosciuta da src/tello_pkg/).
+
+    Necessario perche' colcon esegue una COPIA di questo file da
+    ros_ws/build/... o ros_ws/install/... (non l'originale in ros_ws/src/...),
+    quindi un numero fisso di ".." non porta sempre a ros_ws/. install/, build/
+    e src/ sono pero' sempre sotto-directory dirette di ros_ws/, qualunque sia
+    la copia in esecuzione.
+    """
+    d = os.path.abspath(start_path)
+    for _ in range(10):
+        if os.path.isdir(os.path.join(d, "src", "tello_pkg")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return os.path.abspath(os.path.join(start_path, "..", "..", ".."))
 
 VEL_FILTER_ALPHA = 0.3
 
@@ -150,8 +182,9 @@ class ObservationHandler(Node):
     def __init__(self):
         super().__init__("observation_handler")
 
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        self.declare_parameter("output_dir", script_dir)
+        ros_ws_dir = _find_ros_ws_root(os.path.dirname(os.path.abspath(__file__)))
+        default_output_dir = os.path.join(ros_ws_dir, "Results")
+        self.declare_parameter("output_dir", default_output_dir)
         self.declare_parameter("save_csv", True)
         self.declare_parameter("save_plot", True)
         self.output_dir = self.get_parameter("output_dir").get_parameter_value().string_value
@@ -160,12 +193,25 @@ class ObservationHandler(Node):
         self.start_time = time.time()
         self._history_lock = threading.Lock()
         self.history = []
+        # registrazione CSV/plot gated su flight_ready (vedi flight_state_cb):
+        # parte solo al "Avvia algoritmo", sincronizzata con vel_command_handler(_web)
+        self.flight_ready = False
 
         self.declare_parameter("dof_mask_mode", "full")
         dof_mask_mode = self.get_parameter("dof_mask_mode").get_parameter_value().string_value
         if dof_mask_mode not in DOF_MASKS:
             raise ValueError(f"dof_mask_mode='{dof_mask_mode}' non valido, atteso uno tra {list(DOF_MASKS.keys())}")
         self.dof_mask = np.array(DOF_MASKS[dof_mask_mode])
+
+        # target_mode/advance_mode: SOLO informativi qui (la logica vive in
+        # target_handler), servono per nominare i file CSV/plot di questa
+        # sessione (es. observation_log_singolo_manual_<timestamp>.csv).
+        # vel_command_handler_web li rispecchia qui via set_remote_param,
+        # in aggiunta a quelli mandati a target_handler (vedi set_params()).
+        self.declare_parameter("target_mode", "variabile")
+        self.declare_parameter("advance_mode", "manual")
+        self.target_mode = self.get_parameter("target_mode").get_parameter_value().string_value
+        self.advance_mode = self.get_parameter("advance_mode").get_parameter_value().string_value
 
         # -- stato derivato dal Vicon (aggiornato in pose_cb) --
         self.pos_env = np.zeros(3)
@@ -204,6 +250,15 @@ class ObservationHandler(Node):
         self.policy_action_sub = self.create_subscription(
             Twist, POLICY_ACTION_TOPIC, self.policy_action_cb, 10
         )
+        flight_state_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self.flight_state_sub = self.create_subscription(
+            Bool, FLIGHT_STATE_TOPIC, self.flight_state_cb, flight_state_qos
+        )
 
         self.obs_pub = self.create_publisher(Float32MultiArray, OBSERVATIONS_TOPIC, 10)
         self.land_request_pub = self.create_publisher(Empty, LAND_REQUEST_TOPIC, 10)
@@ -230,6 +285,10 @@ class ObservationHandler(Node):
                     )
                 self.dof_mask = np.array(DOF_MASKS[p.value])
                 self.get_logger().info(f"dof_mask_mode cambiato a runtime: '{p.value}'")
+            elif p.name == "target_mode":
+                self.target_mode = p.value
+            elif p.name == "advance_mode":
+                self.advance_mode = p.value
 
         return SetParametersResult(successful=True)
 
@@ -255,6 +314,26 @@ class ObservationHandler(Node):
     # -------------------- callback policy_handler --------------------
     def policy_action_cb(self, msg: Twist):
         self.prev_action = np.array([msg.linear.x, msg.linear.y, msg.linear.z, msg.angular.z])
+
+    # -------------------- callback flight_state (vel_command_handler/_web) --------------------
+    def flight_state_cb(self, msg: Bool):
+        was_ready = self.flight_ready
+        self.flight_ready = msg.data
+        if self.flight_ready and not was_ready:
+            # "Avvia algoritmo" premuto: azzero t=0 e scarto lo storico pre-volo
+            # cosi' il CSV parte sincronizzato col decollo, non col lancio del nodo.
+            self.start_time = time.time()
+            with self._history_lock:
+                self.history = []
+            self.get_logger().info("flight_ready=True: avvio registrazione CSV/plot (sincronizzata al decollo).")
+        elif was_ready and not self.flight_ready:
+            # Land: salvo SUBITO il CSV/plot di questa sessione di volo (timestamp
+            # dedicato, un file per volo) e svuoto lo storico, cosi' una nuova
+            # sessione (magari con parametri diversi) non si somma/sovrascrive
+            # a quella appena chiusa.
+            self.save_data_and_plots()
+            with self._history_lock:
+                self.history = []
 
     # -------------------- callback Vicon (Tello) --------------------
     def pose_cb(self, msg: PoseStamped):
@@ -402,6 +481,21 @@ class ObservationHandler(Node):
         msg.data = obs.tolist()
         self.obs_pub.publish(msg)
 
+        # Logging CSV/plot SOLO mentre il volo e' attivo (flight_ready, settato da
+        # flight_state_cb al "Avvia algoritmo"): niente dati pre/post-volo nel file.
+        if not self.flight_ready:
+            return
+
+        # Velocita' di riferimento comandata al drone (stessa trasformazione
+        # azione->comando fatta in vel_command_handler.py: scala + clip),
+        # SOLO per logging/confronto con lin_vel_b/ang_vel_b misurate — non
+        # e' l'azione effettivamente inviata da questo processo.
+        cmd_vel_ref = np.clip(self.prev_action, -1.0, 1.0) * VEL_REF_SCALE
+        cmd_vx = float(np.clip(cmd_vel_ref[0], -MAX_LIN_VEL_MPS, MAX_LIN_VEL_MPS))
+        cmd_vy = float(np.clip(cmd_vel_ref[1], -MAX_LIN_VEL_MPS, MAX_LIN_VEL_MPS))
+        cmd_vz = float(np.clip(cmd_vel_ref[2], -MAX_LIN_VEL_MPS, MAX_LIN_VEL_MPS))
+        cmd_wz = float(np.clip(cmd_vel_ref[3], -MAX_YAW_RATE_RADPS, MAX_YAW_RATE_RADPS))
+
         with self._history_lock:
             self.history.append({
                 "time": time.time() - self.start_time,
@@ -416,6 +510,10 @@ class ObservationHandler(Node):
                 "ang_vel_b_x": self.ang_vel_b[0],
                 "ang_vel_b_y": self.ang_vel_b[1],
                 "ang_vel_b_z": self.ang_vel_b[2],
+                "cmd_lin_vel_b_x": cmd_vx,
+                "cmd_lin_vel_b_y": cmd_vy,
+                "cmd_lin_vel_b_z": cmd_vz,
+                "cmd_ang_vel_b_z": cmd_wz,
                 "pos_err_norm": float(np.linalg.norm(pos_err)),
             })
 
@@ -432,9 +530,10 @@ class ObservationHandler(Node):
         self.get_logger().info("Avvio salvataggio dati e generazione grafici...")
         os.makedirs(self.output_dir, exist_ok=True)
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_tag = f"{self.target_mode}_{self.advance_mode}"
 
         if self.save_csv_flag:
-            csv_path = os.path.join(self.output_dir, f"observation_log_{timestamp_str}.csv")
+            csv_path = os.path.join(self.output_dir, f"observation_log_{run_tag}_{timestamp_str}.csv")
             try:
                 with open(csv_path, "w", newline="") as f:
                     writer = csv.DictWriter(f, fieldnames=data[0].keys())
@@ -445,7 +544,7 @@ class ObservationHandler(Node):
                 self.get_logger().error(f"Errore salvataggio CSV: {e}")
 
         if self.save_plot_flag:
-            plot_png = os.path.join(self.output_dir, f"observation_plots_{timestamp_str}.png")
+            plot_png = os.path.join(self.output_dir, f"observation_plots_{run_tag}_{timestamp_str}.png")
             try:
                 t = [d["time"] for d in data]
                 x = [d["x"] for d in data]
@@ -537,25 +636,29 @@ class ObservationHandler(Node):
 
                 # 5: velocita' lineari nel corpo
                 ax5 = fig.add_subplot(3, 2, 5)
-                ax5.plot(t, [d["lin_vel_b_x"] for d in data], label="vx (m/s)", color="r")
-                ax5.plot(t, [d["lin_vel_b_y"] for d in data], label="vy (m/s)", color="g")
-                ax5.plot(t, [d["lin_vel_b_z"] for d in data], label="vz (m/s)", color="b")
+                ax5.plot(t, [d["lin_vel_b_x"] for d in data], label="vx misurata (m/s)", color="r")
+                ax5.plot(t, [d["lin_vel_b_y"] for d in data], label="vy misurata (m/s)", color="g")
+                ax5.plot(t, [d["lin_vel_b_z"] for d in data], label="vz misurata (m/s)", color="b")
+                ax5.plot(t, [d["cmd_lin_vel_b_x"] for d in data], label="vx comandata", color="r", linestyle=":")
+                ax5.plot(t, [d["cmd_lin_vel_b_y"] for d in data], label="vy comandata", color="g", linestyle=":")
+                ax5.plot(t, [d["cmd_lin_vel_b_z"] for d in data], label="vz comandata", color="b", linestyle=":")
                 ax5.set_xlabel("Time (s)")
                 ax5.set_ylabel("Linear vel body (m/s)")
-                ax5.set_title("Linear Velocity (body frame)")
+                ax5.set_title("Linear Velocity (body frame): misurata vs comandata")
                 ax5.grid(True)
-                ax5.legend(fontsize=8)
+                ax5.legend(fontsize=7)
 
                 # 6: velocita' angolari nel corpo
                 ax6 = fig.add_subplot(3, 2, 6)
                 ax6.plot(t, [d["ang_vel_b_x"] for d in data], label="wx (rad/s)", color="darkred")
                 ax6.plot(t, [d["ang_vel_b_y"] for d in data], label="wy (rad/s)", color="darkgreen")
-                ax6.plot(t, [d["ang_vel_b_z"] for d in data], label="wz (rad/s)", color="darkblue")
+                ax6.plot(t, [d["ang_vel_b_z"] for d in data], label="wz misurata (rad/s)", color="darkblue")
+                ax6.plot(t, [d["cmd_ang_vel_b_z"] for d in data], label="wz comandata", color="darkblue", linestyle=":")
                 ax6.set_xlabel("Time (s)")
                 ax6.set_ylabel("Angular vel body (rad/s)")
-                ax6.set_title("Angular Velocity (body frame)")
+                ax6.set_title("Angular Velocity (body frame): misurata vs comandata")
                 ax6.grid(True)
-                ax6.legend(fontsize=8)
+                ax6.legend(fontsize=7)
 
                 plt.tight_layout(rect=[0, 0.03, 1, 0.95])
                 plt.savefig(plot_png, dpi=200)

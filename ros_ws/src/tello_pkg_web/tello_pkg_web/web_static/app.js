@@ -15,11 +15,44 @@ function threeToVicon(v) {
   return [v.z, v.x, v.y];
 }
 
+// Yaw (gradi, attorno all'asse Vicon Z / Three.js Y) -> vettore direzione
+// orizzontale in coordinate Three.js, stessa convenzione di viconToThree
+// (yaw=0 punta lungo Vicon +x, cioe' Three +z).
+function yawDegToThreeDir(yawDeg) {
+  const yawRad = THREE.MathUtils.degToRad(yawDeg);
+  return new THREE.Vector3(Math.sin(yawRad), 0, Math.cos(yawRad));
+}
+
+// Freccia 3D "solida" (cono + cilindro) per indicare lo yaw di drone/target.
+// Non usiamo THREE.ArrowHelper: il suo stelo e' una linea sottile la cui
+// larghezza i browser WebGL ignorano quasi sempre (fissata a 1px), e alla
+// scala della stanza (pochi metri) risultava un puntino praticamente
+// invisibile. depthTest:false + renderOrder alto la tengono sempre visibile
+// sopra sfera/wireframe, anche quando punta verso la camera.
+const ARROW_FORWARD = new THREE.Vector3(0, 0, 1);
+function makeYawArrow(color, shaftLen = 0.5, shaftRadius = 0.025, headLen = 0.2, headRadius = 0.08) {
+  const mat = new THREE.MeshBasicMaterial({ color, depthTest: false });
+  const shaftGeo = new THREE.CylinderGeometry(shaftRadius, shaftRadius, shaftLen, 10);
+  shaftGeo.rotateX(Math.PI / 2);
+  shaftGeo.translate(0, 0, shaftLen / 2);
+  const headGeo = new THREE.ConeGeometry(headRadius, headLen, 10);
+  headGeo.rotateX(Math.PI / 2);
+  headGeo.translate(0, 0, shaftLen + headLen / 2);
+  const group = new THREE.Group();
+  group.add(new THREE.Mesh(shaftGeo, mat), new THREE.Mesh(headGeo, mat));
+  group.renderOrder = 999;
+  return group;
+}
+function setYawArrowDirection(arrowGroup, yawDeg) {
+  arrowGroup.quaternion.setFromUnitVectors(ARROW_FORWARD, yawDegToThreeDir(yawDeg));
+}
+
 // ============================================================
 // SCENA THREE.JS
 // ============================================================
 let scene, camera, renderer, controls;
 let droneMesh, targetMesh, arucoMesh, roomWireframe;
+let droneArrow, targetArrow;
 let roomBoundsSet = false;
 let latestRoomMin = null, latestRoomMax = null;
 
@@ -56,11 +89,23 @@ function initScene() {
   droneMesh = new THREE.Mesh(droneGeo, droneMat);
   scene.add(droneMesh);
 
+  // freccia orientamento drone (yaw), figlia di droneMesh cosi' segue la
+  // sua posizione automaticamente: va solo ruotata via setYawArrowDirection().
+  // Bianca (non blu come la sfera): stesso colore la renderebbe quasi
+  // invisibile per il basso contrasto contro la sfera stessa.
+  droneArrow = makeYawArrow(0xffffff);
+  droneMesh.add(droneArrow);
+
   const targetGeo = new THREE.SphereGeometry(0.06, 16, 16);
   const targetMat = new THREE.MeshBasicMaterial({ color: 0xff5555 });
   targetMesh = new THREE.Mesh(targetGeo, targetMat);
   targetMesh.visible = false;
   scene.add(targetMesh);
+
+  // freccia orientamento target (yaw del waypoint attivo), figlia di
+  // targetMesh: si nasconde/mostra insieme al target.
+  targetArrow = makeYawArrow(0xffffff);
+  targetMesh.add(targetArrow);
 
   const arucoGeo = new THREE.BoxGeometry(0.09, 0.09, 0.09);
   const arucoMat = new THREE.MeshBasicMaterial({ color: 0xbb66ff });
@@ -338,10 +383,14 @@ function updateUI(state) {
 
   const dronePos = viconToThree(state.pos);
   droneMesh.position.copy(dronePos);
+  setYawArrowDirection(droneArrow, state.yaw_deg);
 
   if (state.target) {
     targetMesh.visible = true;
     targetMesh.position.copy(viconToThree(state.target));
+    if (state.target_yaw_deg !== null && state.target_yaw_deg !== undefined) {
+      setYawArrowDirection(targetArrow, state.target_yaw_deg);
+    }
   } else {
     targetMesh.visible = false;
   }

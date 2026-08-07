@@ -63,7 +63,8 @@ import matplotlib.pyplot as plt
 
 from djitellopy import Tello as DJITello
 
-DEFAULT_VICON_POSE_TOPIC = "/vicon/tello_42_boosted/tello_42_boosted"
+# DEFAULT_VICON_POSE_TOPIC = "/vicon/tello_42_boosted/tello_42_boosted"
+DEFAULT_VICON_POSE_TOPIC = "/vicon/Tello_2/Tello_2"
 STATUS_PRINT_PERIOD_S = 0.5
 TELEMETRY_POLL_PERIOD_S = 0.1   # frequenza di campionamento dello state djitellopy per il log
 
@@ -158,7 +159,9 @@ class SensorReader(Node):
             PoseStamped, vicon_pose_topic, self.pose_cb, 10
         )
 
-        self.drone = DJITello()
+        self.declare_parameter("tello_ip", "192.168.16.196")
+        tello_ip = self.get_parameter("tello_ip").get_parameter_value().string_value
+        self.drone = DJITello(host=tello_ip)
 
         self.get_logger().info(
             "[djitellopy] connessione al drone (SOLO telemetria, NESSUN comando di volo)..."

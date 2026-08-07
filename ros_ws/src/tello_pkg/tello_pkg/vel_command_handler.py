@@ -117,7 +117,13 @@ class VelCommandHandler(Node):
         self.last_state_change_time = None
         self._state_warned = False
 
-        self.drone = DJITello()
+        # IP del drone: default 192.168.10.1 (Tello in AP mode, PC connesso
+        # alla sua rete WiFi). Override via --ros-args -p tello_ip:=... se il
+        # drone e' invece in station mode (join di una rete esistente), dove
+        # l'IP e' assegnato dal router e non e' quello di fabbrica.
+        self.declare_parameter("tello_ip", "192.168.16.196")
+        tello_ip = self.get_parameter("tello_ip").get_parameter_value().string_value
+        self.drone = DJITello(host=tello_ip)
 
         self.action_sub = self.create_subscription(
             Twist, POLICY_ACTION_TOPIC, self.policy_action_cb, 10

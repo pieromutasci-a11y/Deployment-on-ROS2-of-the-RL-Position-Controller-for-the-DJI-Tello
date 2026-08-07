@@ -116,7 +116,8 @@ STATUS_PRINT_PERIOD_S = 2.0
 TELEMETRY_POLL_PERIOD_S = 0.1   # frequenza di campionamento dello state djitellopy per log/CSV
 TERMINAL_POLL_TIMEOUT_S = 0.2
 
-DEFAULT_VICON_POSE_TOPIC = "/vicon/tello_42_boosted/tello_42_boosted"
+# DEFAULT_VICON_POSE_TOPIC = "/vicon/tello_42_boosted/tello_42_boosted"
+DEFAULT_VICON_POSE_TOPIC = "/vicon/Tello_2/Tello_2"
 
 # -- sanity check mocap, stesse soglie del controllore --
 MIN_QUAT_NORM = 0.9
@@ -228,7 +229,9 @@ class TakeoffLand(Node):
 
         # -- djitellopy: connect/takeoff/land/movimento (rc control) +
         # lettura batteria/quota dallo state broadcast SDK ufficiale. --
-        self.drone = DJITello()
+        self.declare_parameter("tello_ip", "192.168.10.1")
+        tello_ip = self.get_parameter("tello_ip").get_parameter_value().string_value
+        self.drone = DJITello(host=tello_ip)
 
         self.status_timer = self.create_timer(STATUS_PRINT_PERIOD_S, self.status_cb)
         self.telemetry_timer = self.create_timer(TELEMETRY_POLL_PERIOD_S, self._poll_telemetry)
