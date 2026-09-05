@@ -11,10 +11,10 @@ pass della rete a 25Hz sull'ULTIMA osservazione ricevuta, e pubblica
 l'azione grezza su /tello/policy_action.
 
 L'azione pubblicata e' quella CLAMPATA in [-1, 1], PRIMA di
-VEL_REF_SCALE, prima dei cap MAX_LIN_VEL_MPS/MAX_YAW_RATE_RADPS e prima
-della conversione in rc -100..100: tutta quella parte (scaling fisico +
-dof_mask sull'azione + invio djitellopy) e' responsabilita' di
-vel_command_handler, l'unico nodo con la connessione al drone.
+VEL_REF_SCALE, prima della scala RC_SCALE_PCT e prima della conversione
+in rc -100..100: tutta quella parte (scaling fisico + dof_mask sull'azione
++ invio djitellopy) e' responsabilita' di vel_command_handler, l'unico
+nodo con la connessione al drone.
 
 WATCHDOG OSSERVAZIONI SCADUTE: se non arriva una nuova osservazione da
 oltre OBS_TIMEOUT_S, il nodo SMETTE di pubblicare azioni. E' necessario

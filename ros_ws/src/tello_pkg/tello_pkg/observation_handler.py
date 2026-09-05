@@ -94,17 +94,17 @@ INTEGRAL_TAU_S = 5.0
 INTEGRAL_CLAMP = 1.0
 INTEGRAL_OBS_SCALE = 0.5
 
-ROOM_MIN = np.array([-1.8, -1.5, 0.1])
-ROOM_MAX = np.array([1.8, 1.5, 1.5])
+ROOM_MIN = np.array([-1.5, -1.0, 0.1])
+ROOM_MAX = np.array([1.5, 1.0, 2.0])
     
 # Stessi valori di tello_pkg/vel_command_handler.py: servono SOLO per calcolare,
 # a scopo di logging CSV, la velocita' di riferimento comandata al drone
-# (azione policy scalata+clippata), da confrontare con lin_vel_b/ang_vel_b
-# misurate. NON alimentano alcuna azione qui, e non vanno tenute fuori sync
-# rispetto a vel_command_handler.py / vel_command_handler_web.py.
+# (azione policy scalata + RC_SCALE_PCT), da confrontare con
+# lin_vel_b/ang_vel_b misurate. NON alimentano alcuna azione qui, e non
+# vanno tenute fuori sync rispetto a vel_command_handler.py /
+# vel_command_handler_web.py.
 VEL_REF_SCALE = np.array([1.0, 1.0, 1.0, 1.5])   # [vx,vy,vz,wz]
-MAX_LIN_VEL_MPS = 0.1
-MAX_YAW_RATE_RADPS = 0.15
+RC_SCALE_PCT = np.array([0.40, 0.40, 0.40, 0.40])   # [vx,vy,vz,wz]
 
 DOF_MASKS = {
     "full":     (1.0, 1.0, 1.0, 1.0),
@@ -487,14 +487,20 @@ class ObservationHandler(Node):
             return
 
         # Velocita' di riferimento comandata al drone (stessa trasformazione
-        # azione->comando fatta in vel_command_handler.py: scala + clip),
-        # SOLO per logging/confronto con lin_vel_b/ang_vel_b misurate — non
-        # e' l'azione effettivamente inviata da questo processo.
+        # azione->comando fatta in vel_command_handler.py: scala + RC_SCALE_PCT),
+        # espressa nella stessa unita' "nominale" usata per il comando RC
+        # (valore * 100 = percentuale stick), SOLO per logging/confronto con
+        # lin_vel_b/ang_vel_b misurate — non e' l'azione effettivamente
+        # inviata da questo processo. cmd_vel_ref e' gia' saturato al
+        # massimo fisico [1,1,1,1.5] da VEL_REF_SCALE: NESSUN clip(-1,1)
+        # ulteriore qui, altrimenti wz (max 1.5) verrebbe ritagliato
+        # scorrettamente a 1.0 come accadeva prima del fix in
+        # vel_command_handler(_web).py.
         cmd_vel_ref = np.clip(self.prev_action, -1.0, 1.0) * VEL_REF_SCALE
-        cmd_vx = float(np.clip(cmd_vel_ref[0], -MAX_LIN_VEL_MPS, MAX_LIN_VEL_MPS))
-        cmd_vy = float(np.clip(cmd_vel_ref[1], -MAX_LIN_VEL_MPS, MAX_LIN_VEL_MPS))
-        cmd_vz = float(np.clip(cmd_vel_ref[2], -MAX_LIN_VEL_MPS, MAX_LIN_VEL_MPS))
-        cmd_wz = float(np.clip(cmd_vel_ref[3], -MAX_YAW_RATE_RADPS, MAX_YAW_RATE_RADPS))
+        cmd_vx = float(cmd_vel_ref[0]) * RC_SCALE_PCT[0]
+        cmd_vy = float(cmd_vel_ref[1]) * RC_SCALE_PCT[1]
+        cmd_vz = float(cmd_vel_ref[2]) * RC_SCALE_PCT[2]
+        cmd_wz = float(cmd_vel_ref[3]) * RC_SCALE_PCT[3]
 
         with self._history_lock:
             self.history.append({

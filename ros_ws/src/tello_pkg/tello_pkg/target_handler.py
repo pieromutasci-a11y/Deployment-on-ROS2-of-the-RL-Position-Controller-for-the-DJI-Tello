@@ -93,8 +93,8 @@ from std_msgs.msg import Bool, Empty, Float32MultiArray
 STEP_DT = 0.04                     # 25 Hz, stessa frequenza del loop di controllo HL
 N_WAYPOINTS = 4                    # env.yaml: n_waypoints
 
-ROOM_MIN = np.array([-1.8, -1.5, 0.1])
-ROOM_MAX = np.array([1.8, 1.5, 1.5])
+ROOM_MIN = np.array([-1.5, -1.0, 0.1])
+ROOM_MAX = np.array([1.5, 1.0, 2.0])
 TARGET_ROOM_MARGIN = 0.8           # env.yaml: target_room_margin
 
 TARGET_REACH_THRESHOLD_M = 0.15

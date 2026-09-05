@@ -100,8 +100,16 @@ from tello_pkg.observation_handler import (
 # CONFIG — stessi valori usati in tello_pkg/vel_command_handler.py
 # ============================================================
 VEL_REF_SCALE = np.array([1.0, 1.0, 1.0, 1.5])   # [vx,vy,vz,wz]
-MAX_LIN_VEL_MPS = 0.15
-MAX_YAW_RATE_RADPS = 0.18
+
+# NON e' un clamp fisico in m/s: il riferimento della policy (dopo
+# VEL_REF_SCALE) e' per costruzione gia' entro i limiti fisici, quindi non
+# va tagliato. RC_SCALE_PCT scala PROPORZIONALMENTE il comando RC finale
+# (dopo la conversione riferimento -> percentuale stick in _send_vel_command):
+# un riferimento di 1.0 m/s produrrebbe RC=100 a piena autorita', con uno
+# scaler di 0.40 diventa RC=40. Un valore INDIPENDENTE per asse [vx,vy,vz,wz]
+# (stesso ordine di VEL_REF_SCALE), cosi' si puo' es. tenere vz/wz piu'
+# prudenti di vx/vy senza toccare gli altri assi.
+RC_SCALE_PCT = np.array([0.50, 0.50, 0.50, 0.90])   # [vx,vy,vz,wz]
 
 ACTION_TIMEOUT_S = 0.2
 
@@ -279,11 +287,7 @@ class VelCommandHandlerWeb(Node):
 
         action = np.clip(self.last_action, -1.0, 1.0)
         target_vel_ref = action * VEL_REF_SCALE
-
-        vx = float(np.clip(target_vel_ref[0], -MAX_LIN_VEL_MPS, MAX_LIN_VEL_MPS))
-        vy = float(np.clip(target_vel_ref[1], -MAX_LIN_VEL_MPS, MAX_LIN_VEL_MPS))
-        vz = float(np.clip(target_vel_ref[2], -MAX_LIN_VEL_MPS, MAX_LIN_VEL_MPS))
-        wz = float(np.clip(target_vel_ref[3], -MAX_YAW_RATE_RADPS, MAX_YAW_RATE_RADPS))
+        vx, vy, vz, wz = (float(v) for v in target_vel_ref)
         self._send_vel_command(vx, vy, vz, wz)
 
     def watchdog_cb(self):
@@ -442,10 +446,21 @@ class VelCommandHandlerWeb(Node):
             self.get_logger().error(f"Errore azzerando i comandi rc via djitellopy: {e}")
 
     def _send_vel_command(self, vx, vy, vz, wz):
-        forward_backward = int(round(np.clip(vx, -1.0, 1.0) * 100))
-        left_right = int(round(np.clip(-vy, -1.0, 1.0) * 100))
-        up_down = int(round(np.clip(vz, -1.0, 1.0) * 100))
-        yaw = int(round(np.clip(-wz, -1.0, 1.0) * 100))
+        # La SATURAZIONE vera avviene una volta sola, a monte, in
+        # policy_action_cb: action clampata [-1,1] * VEL_REF_SCALE, quindi
+        # [vx,vy,vz,wz] sono gia' bloccati entro i massimi fisici
+        # [1,1,1,1.5]. Qui NON si risatura piu': si normalizza ogni asse
+        # rispetto al proprio massimo (VEL_REF_SCALE) cosi' che "al valore
+        # massimo fisico" corrisponda sempre "100% di stick" prima della
+        # percentuale — altrimenti wz (max 1.5) verrebbe ritagliato
+        # scorrettamente a 1.0 da un clip(-1,1) fisso. RC_SCALE_PCT scala
+        # PROPORZIONALMENTE il comando finale, con un fattore INDIPENDENTE
+        # per asse (es. vx al suo massimo -> RC=100 a piena autorita', con
+        # RC_SCALE_PCT[0]=0.4 diventa RC=40).
+        forward_backward = int(round(np.clip(vx / VEL_REF_SCALE[0], -1.0, 1.0) * 100 * RC_SCALE_PCT[0]))
+        left_right = int(round(np.clip(-vy / VEL_REF_SCALE[1], -1.0, 1.0) * 100 * RC_SCALE_PCT[1]))
+        up_down = int(round(np.clip(vz / VEL_REF_SCALE[2], -1.0, 1.0) * 100 * RC_SCALE_PCT[2]))
+        yaw = int(round(np.clip(-wz / VEL_REF_SCALE[3], -1.0, 1.0) * 100 * RC_SCALE_PCT[3]))
         try:
             self.drone.send_rc_control(left_right, forward_backward, up_down, yaw)
         except Exception as e:

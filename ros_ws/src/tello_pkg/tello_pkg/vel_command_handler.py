@@ -21,8 +21,12 @@ RESPONSABILITA':
   - connessione/takeoff/land tramite djitellopy.
   - riceve /tello/policy_action (Twist, azione GREZZA clampata [-1,1]
     da policy_handler) e la converte in comando reale al drone:
-    VEL_REF_SCALE -> cap di sicurezza MAX_LIN_VEL_MPS/MAX_YAW_RATE_RADPS
-    -> *100 -> send_rc_control. NESSUN mascheramento dof_mask qui: la
+    VEL_REF_SCALE -> *100 -> *RC_SCALE_PCT -> send_rc_control. Il
+    riferimento della policy NON viene piu' clampato in m/s: e' gia' entro
+    i limiti fisici per costruzione; RC_SCALE_PCT (uno per asse [vx,vy,vz,wz])
+    scala PROPORZIONALMENTE il comando finale (es. 1.0 m/s di riferimento
+    su vx -> RC=100 a piena autorita', con RC_SCALE_PCT[0]=0.4 diventa
+    RC=40). NESSUN mascheramento dof_mask qui: la
     policy ha gia' imparato a non generare vy in uniciclo (dof_mask e'
     SOLO una feature di osservazione, mai un hard mask sull'azione:
     vedi memoria feedback_dof_mask_observation_only).
@@ -60,8 +64,16 @@ from djitellopy import Tello as DJITello
 # CONFIG — stessi valori usati in position_controller_VICON_VERSION.py
 # ============================================================
 VEL_REF_SCALE = np.array([1.0, 1.0, 1.0, 1.5])   # [vx,vy,vz,wz]: target_lin_vel_*_scale/target_yaw_vel_scale
-MAX_LIN_VEL_MPS = 0.1
-MAX_YAW_RATE_RADPS = 0.15
+
+# NON e' un clamp fisico in m/s: il riferimento della policy (dopo
+# VEL_REF_SCALE) e' per costruzione gia' entro i limiti fisici, quindi non
+# va tagliato. RC_SCALE_PCT scala PROPORZIONALMENTE il comando RC finale
+# (dopo la conversione riferimento -> percentuale stick in _send_vel_command):
+# un riferimento di 1.0 m/s produrrebbe RC=100 a piena autorita', con uno
+# scaler di 0.4 diventa RC=40. Un valore INDIPENDENTE per asse [vx,vy,vz,wz]
+# (stesso ordine di VEL_REF_SCALE), cosi' si puo' es. tenere vz/wz piu'
+# prudenti di vx/vy senza toccare gli altri assi.
+RC_SCALE_PCT = np.array([0.40, 0.40, 0.40, 0.40])   # [vx,vy,vz,wz]
 
 ACTION_TIMEOUT_S = 0.2             # 5 cicli @25Hz: oltre questo, hover forzato
 
@@ -168,11 +180,7 @@ class VelCommandHandler(Node):
 
         action = np.clip(self.last_action, -1.0, 1.0)
         target_vel_ref = action * VEL_REF_SCALE  # [vx,vy,vz,wz] frame corpo, m/s e rad/s
-
-        vx = float(np.clip(target_vel_ref[0], -MAX_LIN_VEL_MPS, MAX_LIN_VEL_MPS))
-        vy = float(np.clip(target_vel_ref[1], -MAX_LIN_VEL_MPS, MAX_LIN_VEL_MPS))
-        vz = float(np.clip(target_vel_ref[2], -MAX_LIN_VEL_MPS, MAX_LIN_VEL_MPS))
-        wz = float(np.clip(target_vel_ref[3], -MAX_YAW_RATE_RADPS, MAX_YAW_RATE_RADPS))
+        vx, vy, vz, wz = (float(v) for v in target_vel_ref)
         self._send_vel_command(vx, vy, vz, wz)
 
     # -------------------- watchdog azione scaduta --------------------
@@ -362,15 +370,24 @@ class VelCommandHandler(Node):
 
     def _send_vel_command(self, vx, vy, vz, wz):
         """Converte [vx,vy,vz,wz] (m/s, rad/s, frame corpo FLU) in valori rc
-        -100..100 moltiplicando DIRETTAMENTE per 100 (gia' clampati sopra ai
-        cap di sicurezza <=1.0). NON e' una conversione cm/s calibrata:
-        send_rc_control accetta solo deflessione stick -100..100, senza
-        corrispondenza fisica dichiarata dall'SDK. Scelta esplicita
-        dell'utente, DA VALIDARE IN VOLO."""
-        forward_backward = int(round(np.clip(vx, -1.0, 1.0) * 100))
-        left_right = int(round(np.clip(-vy, -1.0, 1.0) * 100))
-        up_down = int(round(np.clip(vz, -1.0, 1.0) * 100))
-        yaw = int(round(np.clip(-wz, -1.0, 1.0) * 100))
+        -100..100 (NON una conversione cm/s calibrata: send_rc_control
+        accetta solo deflessione stick -100..100, senza corrispondenza
+        fisica dichiarata dall'SDK).
+        La SATURAZIONE vera avviene una volta sola, a monte, in
+        policy_action_cb: action clampata [-1,1] * VEL_REF_SCALE, quindi
+        [vx,vy,vz,wz] sono gia' bloccati entro i massimi fisici [1,1,1,1.5].
+        Qui NON si risatura piu': si normalizza ogni asse rispetto al
+        proprio massimo (VEL_REF_SCALE) cosi' che "al valore massimo
+        fisico" corrisponda sempre "100% di stick" prima della percentuale
+        — altrimenti wz (max 1.5) verrebbe ritagliato scorrettamente a 1.0
+        da un clip(-1,1) fisso. RC_SCALE_PCT scala PROPORZIONALMENTE il
+        comando finale, con un fattore INDIPENDENTE per asse (es. vx al suo
+        massimo -> RC=100 a piena autorita', con RC_SCALE_PCT[0]=0.4
+        diventa RC=40). Scelta esplicita dell'utente, DA VALIDARE IN VOLO."""
+        forward_backward = int(round(np.clip(vx / VEL_REF_SCALE[0], -1.0, 1.0) * 100 * RC_SCALE_PCT[0]))
+        left_right = int(round(np.clip(-vy / VEL_REF_SCALE[1], -1.0, 1.0) * 100 * RC_SCALE_PCT[1]))
+        up_down = int(round(np.clip(vz / VEL_REF_SCALE[2], -1.0, 1.0) * 100 * RC_SCALE_PCT[2]))
+        yaw = int(round(np.clip(-wz / VEL_REF_SCALE[3], -1.0, 1.0) * 100 * RC_SCALE_PCT[3]))
         try:
             self.drone.send_rc_control(left_right, forward_backward, up_down, yaw)
         except Exception as e:
