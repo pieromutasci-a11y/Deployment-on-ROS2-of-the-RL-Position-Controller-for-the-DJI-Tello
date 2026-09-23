@@ -1,31 +1,11 @@
 #!/usr/bin/env python3
-"""
-Nodo ROS2 'policy_handler' (package tello_pkg): esegue in inferenza la
-policy HL (controllore di posizione) addestrata in Isaac Lab, per la
-pipeline modulare (Percezione / Policy / Attuazione / Target).
+"""Nodo 'policy_handler' (tello_pkg): inferenza della policy di posizione (Isaac Lab, skrl PPO).
 
-Non tocca MAI djitellopy, non ha nessuna logica di volo: e' puro
-calcolo. Si sottoscrive a 'observations' (pubblicato da
-observation_handler, Float32MultiArray a 52 elementi), fa il forward
-pass della rete a 25Hz sull'ULTIMA osservazione ricevuta, e pubblica
-l'azione grezza su /tello/policy_action.
-
-L'azione pubblicata e' quella CLAMPATA in [-1, 1], PRIMA di
-VEL_REF_SCALE, prima della scala RC_SCALE_PCT e prima della conversione
-in rc -100..100: tutta quella parte (scaling fisico + dof_mask sull'azione
-+ invio djitellopy) e' responsabilita' di vel_command_handler, l'unico
-nodo con la connessione al drone.
-
-WATCHDOG OSSERVAZIONI SCADUTE: se non arriva una nuova osservazione da
-oltre OBS_TIMEOUT_S, il nodo SMETTE di pubblicare azioni. E' necessario
-perche' senza questo watchdog il nodo continuerebbe a ripubblicare
-un'azione "fresca" (stesso timestamp di pubblicazione) calcolata pero'
-su un'osservazione VECCHIA/congelata: vel_command_handler vedrebbe
-arrivare messaggi regolarmente e non scatterebbe mai il suo watchdog di
-hover, anche con dati Vicon morti da tempo. Fermare la pubblicazione
-qui e' cio' che fa propagare a cascata la "fame di dati" fino
-all'attuazione (observation_handler si ferma -> policy_handler si ferma
--> vel_command_handler nota i comandi scaduti e va in hover/atterra).
+Sottoscrive 'observations' (52 float da observation_handler), fa il forward pass
+sull'ultima osservazione e pubblica l'azione clampata in [-1, 1] su /tello/policy_action.
+Nessun accesso al drone: scaling fisico e invio RC sono di vel_command_handler.
+Se l'osservazione e' piu' vecchia di OBS_TIMEOUT_S smette di pubblicare, cosi' il watchdog di
+vel_command_handler scatta invece di vedere azioni "fresche" calcolate su dati congelati.
 """
 
 import math
@@ -40,16 +20,16 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from std_msgs.msg import Float32MultiArray
 
-STEP_DT = 0.01                     # 25 Hz
+# Costanti, topic e percorso del checkpoint (sovrascrivibile con POLICY_CKPT_PATH)
+STEP_DT = 0.04  # 25 Hz, come la frequenza di decisione in Isaac Lab
 OBS_SIZE = 52
 ACTION_SIZE = 4
 
 OBSERVATIONS_TOPIC = "observations"
 POLICY_ACTION_TOPIC = "/tello/policy_action"
 
-OBS_TIMEOUT_S = 0.2                # 5 cicli @25Hz: oltre questo, l'obs e' considerata scaduta
+OBS_TIMEOUT_S = 0.2
 
-# -- checkpoint: cartella condivisa in tello_pkg (vedi package.xml/setup.py) --
 DEFAULT_CKPT_PATH = (
     "/ros_workspace/src/tello_pkg/policy_pos_controller/2026-07-31_13-02-43_ppo_torch/"
     "checkpoints/best_agent.pt"
@@ -57,8 +37,8 @@ DEFAULT_CKPT_PATH = (
 CKPT_PATH = os.environ.get("POLICY_CKPT_PATH", DEFAULT_CKPT_PATH)
 
 
+# Rete della policy e caricamento del checkpoint skrl (pesi e normalizzazione)
 class SkrlMlpPolicy(torch.nn.Module):
-    """Trunk 'net_container.*' (256,128,64, ELU) + head 'policy_layer' (64->4)."""
     def __init__(self, dims, act=torch.nn.ELU):
         super().__init__()
         layers = []
@@ -115,6 +95,7 @@ def load_skrl_policy(ckpt_path, expected_in, expected_out, device="cpu"):
     return model, running_mean, running_var
 
 
+# Nodo: inferenza periodica sull'ultima osservazione, con watchdog di osservazione scaduta
 class PolicyHandler(Node):
     def __init__(self):
         super().__init__("policy_handler")
@@ -125,7 +106,7 @@ class PolicyHandler(Node):
         self.get_logger().info(f"Policy caricata da: {CKPT_PATH}")
 
         self._obs_lock = threading.Lock()
-        self.latest_obs = None            # torch.Tensor(52,) oppure None
+        self.latest_obs = None
         self.last_obs_wall_time = None
 
         self.obs_sub = self.create_subscription(
@@ -160,7 +141,7 @@ class PolicyHandler(Node):
             )
 
         if obs is None or obs_age > OBS_TIMEOUT_S:
-            return  # nessuna osservazione fresca: non pubblico (fame di dati a cascata)
+            return
 
         obs_n = (obs - self.run_mean) / torch.sqrt(self.run_var + 1e-8)
         with torch.no_grad():

@@ -1,25 +1,12 @@
 #!/usr/bin/env python3
-"""
-Lancia TUTTA la pipeline modulare con interfaccia WEB: target_handler,
-observation_handler, policy_handler (dal package tello_pkg, RIUSATI senza
-nessuna modifica: non toccano mai djitellopy ne' il web) +
-vel_command_handler_web (dal package tello_pkg_web, UNICA connessione
-djitellopy al drone + dashboard FastAPI/WebSocket).
+"""Lancia la pipeline modulare con interfaccia web: target_handler, observation_handler, policy_handler
+(da tello_pkg, invariati) + vel_command_handler_web (tello_pkg_web: unica connessione al drone + dashboard).
 
-A DIFFERENZA di tello_pkg/launch/full_pipeline.launch.py: qui NON serve un
-secondo terminale con mission_console. Il server web non ha il problema di
-stdin non inoltrato da 'ros2 launch' (e' pilotato da HTTP/WebSocket, non da
-tastiera): tutto il controllo interattivo (parametri, custom target
-cliccato in scena 3D, start/land/avanzamento waypoint) passa dal browser,
-aperto su http://<host>:8080/ dopo il lancio.
+Non serve mission_console: parametri, custom target, start/land e avanzamento passano dal browser
+su http://<host>:8080/. Il nodo si connette al drone all'avvio ma decolla solo dal tasto
+"Avvia algoritmo".
 
-CANCELLO DI PARTENZA: vel_command_handler_web si CONNETTE al drone appena
-parte (per leggere batteria/stato, visibili subito in dashboard), ma NON
-decolla da solo — aspetta il tasto "Avvia algoritmo" nella pagina web
-(equivalente del comando 'start' di mission_console).
-
-Esempio:
-    ros2 launch tello_pkg_web web_pipeline.launch.py target_mode:=custom dof_mask_mode:=uniciclo
+Esempio: ros2 launch tello_pkg_web web_pipeline.launch.py target_mode:=custom dof_mask_mode:=uniciclo
 """
 
 from launch import LaunchDescription
@@ -37,6 +24,7 @@ def generate_launch_description():
     save_plot = LaunchConfiguration("save_plot")
 
     return LaunchDescription([
+        # Argomenti di lancio: valori iniziali dei parametri dei nodi
         DeclareLaunchArgument("target_mode", default_value="variabile",
                                description="singolo | variabile | custom | hover | aruco_target"),
         DeclareLaunchArgument("advance_mode", default_value="manual",
@@ -48,6 +36,7 @@ def generate_launch_description():
         DeclareLaunchArgument("save_csv", default_value="true"),
         DeclareLaunchArgument("save_plot", default_value="true"),
 
+        # Nodi della pipeline
         Node(
             package="tello_pkg",
             executable="target_handler",

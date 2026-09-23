@@ -1,34 +1,24 @@
-// ============================================================
-// CONFIG
-// ============================================================
+// Dashboard web del drone: scena 3D (Three.js), grafici temporali, form e bottoni; stato via WebSocket (/ws/state).
+
+// Configurazione
 const WS_URL = `ws://${location.host}/ws/state`;
 
-// Vicon -> Three.js: permutazione ciclica, nessun segno da invertire.
-// Vicon X (verso l'osservatore) -> Three Z, Vicon Y (destra) -> Three X,
-// Vicon Z (alto) -> Three Y.
+// Coordinate: Vicon (x, y, z) -> Three.js (X, Y, Z) = (y, z, x), e inversa
 function viconToThree(p) {
   return new THREE.Vector3(p[1], p[2], p[0]);
 }
 
-// Inversa di viconToThree: da un punto Three.js a coordinate Vicon [x,y,z].
 function threeToVicon(v) {
   return [v.z, v.x, v.y];
 }
 
-// Yaw (gradi, attorno all'asse Vicon Z / Three.js Y) -> vettore direzione
-// orizzontale in coordinate Three.js, stessa convenzione di viconToThree
-// (yaw=0 punta lungo Vicon +x, cioe' Three +z).
+// Yaw (gradi) -> direzione orizzontale in Three.js (yaw=0 lungo Vicon +x)
 function yawDegToThreeDir(yawDeg) {
   const yawRad = THREE.MathUtils.degToRad(yawDeg);
   return new THREE.Vector3(Math.sin(yawRad), 0, Math.cos(yawRad));
 }
 
-// Freccia 3D "solida" (cono + cilindro) per indicare lo yaw di drone/target.
-// Non usiamo THREE.ArrowHelper: il suo stelo e' una linea sottile la cui
-// larghezza i browser WebGL ignorano quasi sempre (fissata a 1px), e alla
-// scala della stanza (pochi metri) risultava un puntino praticamente
-// invisibile. depthTest:false + renderOrder alto la tengono sempre visibile
-// sopra sfera/wireframe, anche quando punta verso la camera.
+// Freccia 3D solida per lo yaw (non ArrowHelper: lo stelo sottile e' quasi invisibile); depthTest off per restare sempre in vista
 const ARROW_FORWARD = new THREE.Vector3(0, 0, 1);
 function makeYawArrow(color, shaftLen = 0.5, shaftRadius = 0.025, headLen = 0.2, headRadius = 0.08) {
   const mat = new THREE.MeshBasicMaterial({ color, depthTest: false });
@@ -47,18 +37,14 @@ function setYawArrowDirection(arrowGroup, yawDeg) {
   arrowGroup.quaternion.setFromUnitVectors(ARROW_FORWARD, yawDegToThreeDir(yawDeg));
 }
 
-// ============================================================
-// SCENA THREE.JS
-// ============================================================
+// Scena Three.js
 let scene, camera, renderer, controls;
 let droneMesh, targetMesh, arucoMesh, roomWireframe;
 let droneArrow, targetArrow;
 let roomBoundsSet = false;
 let latestRoomMin = null, latestRoomMax = null;
 
-// -- piazzamento target custom: raycast contro un piano orizzontale
-// all'altezza scelta dallo slider (coordinate Vicon), attivo solo quando
-// target_mode=='custom' e' selezionato nel form. --
+// Piazzamento del target custom: raycast su un piano orizzontale all'altezza dello slider, solo con target_mode 'custom'
 const raycaster = new THREE.Raycaster();
 const placementPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
 let pointerDownPos = null;
@@ -89,10 +75,6 @@ function initScene() {
   droneMesh = new THREE.Mesh(droneGeo, droneMat);
   scene.add(droneMesh);
 
-  // freccia orientamento drone (yaw), figlia di droneMesh cosi' segue la
-  // sua posizione automaticamente: va solo ruotata via setYawArrowDirection().
-  // Bianca (non blu come la sfera): stesso colore la renderebbe quasi
-  // invisibile per il basso contrasto contro la sfera stessa.
   droneArrow = makeYawArrow(0xffffff);
   droneMesh.add(droneArrow);
 
@@ -102,8 +84,6 @@ function initScene() {
   targetMesh.visible = false;
   scene.add(targetMesh);
 
-  // freccia orientamento target (yaw del waypoint attivo), figlia di
-  // targetMesh: si nasconde/mostra insieme al target.
   targetArrow = makeYawArrow(0xffffff);
   targetMesh.add(targetArrow);
 
@@ -127,7 +107,6 @@ function initScene() {
     const dx = ev.clientX - pointerDownPos.x;
     const dy = ev.clientY - pointerDownPos.y;
     pointerDownPos = null;
-    // solo un vero CLICK (non un drag di OrbitControls) piazza il target
     if (Math.hypot(dx, dy) > 4) return;
     handleSceneClick(ev);
   });
@@ -135,9 +114,7 @@ function initScene() {
   animate();
 }
 
-// ============================================================
-// PIAZZAMENTO TARGET CUSTOM (click sulla scena 3D)
-// ============================================================
+// Click sulla scena: piazza il target custom
 function handleSceneClick(ev) {
   const modeSelect = document.getElementById('select-target-mode');
   if (!modeSelect || modeSelect.value !== 'custom') return;
@@ -145,7 +122,7 @@ function handleSceneClick(ev) {
 
   const zInput = document.getElementById('custom-target-z');
   const zVicon = parseFloat(zInput.value);
-  placementPlane.constant = -zVicon; // piano y = zVicon in coordinate Three (Vicon Z -> Three Y)
+  placementPlane.constant = -zVicon;
 
   const rect = renderer.domElement.getBoundingClientRect();
   const mouse = new THREE.Vector2(
@@ -223,24 +200,7 @@ function animate() {
   renderer.render(scene, camera);
 }
 
-// ============================================================
-// PLOT CON GRID + ASSE Y NUMERATO E UNITA' DI MISURA
-// ============================================================
-// ============================================================
-// PLOT CON GRID + ASSE Y NUMERATO E UNITA' DI MISURA
-// Canvas ad alta risoluzione: il buffer interno viene sincronizzato
-// con la dimensione REALE (CSS) del canvas moltiplicata per
-// devicePixelRatio, altrimenti il browser stira un'immagine a bassa
-// risoluzione producendo linee sfocate/pixelate (bug visibile con
-// schermi a scaling >100% o quando il canvas viene ridimensionato via
-// flexbox/CSS invece che con attributi width/height fissi).
-// ============================================================
-// ============================================================
-// PLOT CON GRID + ASSE Y NUMERATO
-// (unita' di misura NON piu' ripetuta dentro il canvas: e' gia'
-// presente nel titolo <h3> sopra ciascun grafico, ripeterla causava
-// sovrapposizione con legenda e primo valore dell'asse Y)
-// ============================================================
+// Grafici a serie temporale su canvas (buffer sincronizzato a devicePixelRatio per evitare linee sfocate)
 class TimeSeriesPlot {
   constructor(canvasId, labels, colors, windowSize = 150) {
     this.canvas = document.getElementById(canvasId);
@@ -250,7 +210,7 @@ class TimeSeriesPlot {
     this.windowSize = windowSize;
     this.series = labels.map(() => []);
     this.marginLeft = 40;
-    this.marginTop = 24;    // <-- aumentato: spazio per la riga legenda, separata dalla prima griglia
+    this.marginTop = 24;
     this.marginBottom = 4;
     this.marginRight = 4;
 
@@ -301,7 +261,6 @@ class TimeSeriesPlot {
     const yFor = (v) => this.marginTop + plotH - ((v - vmin) / (vmax - vmin)) * plotH;
     const xFor = (idx) => this.marginLeft + (idx / (this.windowSize - 1)) * plotW;
 
-    // -- riga legenda, in cima, ben separata dalla griglia sottostante --
     ctx.font = '10px sans-serif';
     ctx.textBaseline = 'middle';
     ctx.textAlign = 'left';
@@ -310,7 +269,6 @@ class TimeSeriesPlot {
       ctx.fillText(label, this.marginLeft + i * 34, 10);
     });
 
-    // -- griglia orizzontale + etichette asse Y (parte SOTTO la legenda) --
     const nGrid = 4;
     ctx.lineWidth = 1;
     for (let i = 0; i <= nGrid; i++) {
@@ -335,7 +293,6 @@ class TimeSeriesPlot {
       ctx.stroke();
     }
 
-    // -- serie --
     this.series.forEach((serie, i) => {
       if (serie.length < 2) return;
       ctx.strokeStyle = this.colors[i];
@@ -355,9 +312,7 @@ const plotLinVel = new TimeSeriesPlot('plot-linvel', ['vx', 'vy', 'vz'], ['#4da6
 const plotAngVel = new TimeSeriesPlot('plot-angvel', ['wx', 'wy', 'wz'], ['#4da6ff', '#5cd65c', '#ff9d4d']);
 const plotRPY = new TimeSeriesPlot('plot-rpy', ['roll', 'pitch', 'yaw'], ['#4da6ff', '#5cd65c', '#ff9d4d']);
 
-// ============================================================
-// AGGIORNAMENTO UI DA STATO RICEVUTO
-// ============================================================
+// Aggiornamento della UI dallo stato ricevuto
 function setIndicator(id, ok, textOn, textOff) {
   const el = document.getElementById(id);
   el.className = 'indicator ' + (ok ? 'on' : 'off');
@@ -419,9 +374,7 @@ function updateUI(state) {
   document.getElementById('btn-start').disabled = algoBusy;
 }
 
-// ============================================================
-// WEBSOCKET
-// ============================================================
+// WebSocket di stato, con riconnessione automatica
 function connectWebSocket() {
   const ws = new WebSocket(WS_URL);
   ws.onmessage = (ev) => updateUI(JSON.parse(ev.data));
@@ -429,9 +382,7 @@ function connectWebSocket() {
   ws.onerror = () => ws.close();
 }
 
-// ============================================================
-// FORM E BOTTONI
-// ============================================================
+// Form e bottoni
 document.getElementById('params-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const fd = new FormData(e.target);
@@ -462,8 +413,6 @@ document.getElementById('btn-start').addEventListener('click', () => fetch('/api
 document.getElementById('btn-land').addEventListener('click', () => fetch('/api/land', { method: 'POST' }));
 document.getElementById('btn-advance').addEventListener('click', () => fetch('/api/advance', { method: 'POST' }));
 
-// ============================================================
-// AVVIO
-// ============================================================
+// Avvio
 initScene();
 connectWebSocket();

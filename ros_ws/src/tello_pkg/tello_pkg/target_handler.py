@@ -1,76 +1,15 @@
 #!/usr/bin/env python3
-"""
-Nodo ROS2 'target_handler' (package tello_pkg): possiede la logica di
-generazione/avanzamento del TARGET per la pipeline modulare del
-controllore di posizione (Percezione / Policy / Attuazione / Target).
+"""Nodo 'target_handler' (tello_pkg): genera e fa avanzare la coda di waypoint (nessuna connessione al drone).
 
-Non tocca MAI djitellopy: non ha nessuna connessione al drone. Riceve
-solo la posa Vicon del Tello (per l'avanzamento 'auto' e per catturare
-l'hover al takeoff) e la posa Vicon dell'ArUco (per 'aruco_target'), e
-si abbona a /tello/flight_state (pubblicato da vel_command_handler) per
-sapere quando il drone e' decollato.
+Legge la posa Vicon del Tello e dell'ArUco e /tello/flight_state.
+target_mode (parametro, modificabile a runtime): variabile (N_WAYPOINTS target random), singolo
+(uno ripetuto), custom (fisso da custom_target_x/y/z/yaw), hover (posa al decollo), aruco_target
+(posizione live dell'ArUco). advance_mode: manual (INVIO da terminale o Empty su
+/target_handler/advance) oppure auto (criterio del training: errore sotto soglia per
+TARGET_HOLD_TIME_S). Completate num_queues code pubblica /tello/land_request.
 
-MODALITA' (parametro ROS2 target_mode, modificabile A RUNTIME):
-    variabile     N_WAYPOINTS target random distinti in sequenza dentro
-                  la stanza (ROOM_MIN/ROOM_MAX, margine TARGET_ROOM_MARGIN).
-    singolo       1 solo target random, ripetuto su tutti gli slot della
-                  coda.
-    custom        1 solo target FISSO, preso dai parametri ROS2
-                  custom_target_x/y/z/yaw (modificabili a runtime).
-                  Stessa meccanica di 'singolo' ma senza randomicita'.
-    hover         il target diventa la posizione/yaw ESATTI del drone nel
-                  momento in cui /tello/flight_state passa a True
-                  (appena decollato). Fisso finche' non cambia modalita'.
-    aruco_target  come 'singolo'/'variabile' per avanzamento e
-                  num_queues (e' in QUEUE_MODES), ma il VALORE del
-                  target e' la posizione Vicon CORRENTE del subject
-                  ArUco (ARUCO_POSE_TOPIC, yaw fissato a 0), rinfrescata
-                  ad OGNI tick (25Hz) e ripetuta sui 4 slot: resta
-                  sempre "live", non si blocca al valore campionato
-                  all'inizio della coda.
-
-Il cambio di target_mode/advance_mode/num_queues/custom_target_* a
-runtime (es. 'ros2 param set') e' gestito da un
-add_on_set_parameters_callback: il nuovo target viene generato
-IMMEDIATAMENTE al cambio, non al giro successivo. Nessuna protezione
-contro salti improvvisi del target: e' una scelta esplicita, la
-responsabilita' di eventuali limiti di velocita'/accelerazione resta
-del nodo di attuazione (vel_command_handler) o della policy.
-
-AVANZAMENTO (parametro advance_mode, rilevante solo per singolo/variabile/
-aruco_target): l'avanzamento manuale ha DUE ingressi equivalenti (stesso
-metodo advance_manual()):
-    - INVIO (riga vuota) da terminale, letto dal thread stdin di QUESTO
-      processo (utile lanciando il nodo da solo con 'ros2 run').
-    - un messaggio std_msgs/Empty su ADVANCE_TOPIC
-      (/target_handler/advance) — serve per pilotarlo da un altro
-      processo, es. il nodo 'mission_console' incluso nei launch file
-      (ros2 launch NON inoltra in modo affidabile lo stdin del
-      terminale a piu' processi figli contemporaneamente).
-    manual  avanza al prossimo waypoint della coda. Ignorato nelle
-            modalita' custom/hover (non hanno una coda da avanzare).
-    auto    stesso identico criterio ESATTO del training
-            (_update_waypoint in pos_controller_env.py): dist E yaw_err
-            sotto soglia per TARGET_HOLD_TIME_S secondi CONSECUTIVI.
-
-num_queues: quante code (rigenerazioni di N_WAYPOINTS target, solo per
-singolo/variabile) completare prima di richiedere l'atterraggio. Questo
-nodo NON possiede la connessione al drone, quindi non puo' chiamare
-land() da solo: al raggiungimento del limite pubblica un segnale VUOTO
-su /tello/land_request, che vel_command_handler ascolta per avviare
-l'atterraggio vero (stesso trattamento di batteria critica/Ctrl+C).
-
-OUTPUT verso observation_handler:
-    topic 'targets' (std_msgs/Float32MultiArray), QoS reliable +
-    transient_local (un subscriber che si connette tardi riceve subito
-    l'ultimo target pubblicato), pubblicato ad ogni tick del timer
-    interno (STEP_DT, 25Hz) — anche quando il target non cambia, per
-    semplicita' (QoS transient_local copre comunque i subscriber tardivi).
-    Layout del vettore (17 elementi):
-        [0]                 wp_idx corrente (float, castare a int)
-        [1:13]  (12 elementi)  wp_pos_queue appiattita, N_WAYPOINTS*3,
-                                riga k = [x_k, y_k, z_k]
-        [13:17] (4 elementi)   wp_yaw_queue, N_WAYPOINTS yaw in radianti
+Output: 'targets' (Float32MultiArray, QoS reliable + transient_local), a ogni tick, 17 elementi:
+    [0] wp_idx | [1:13] wp_pos_queue appiattita (N_WAYPOINTS x [x, y, z]) | [13:17] wp_yaw_queue
 """
 
 import math
@@ -86,22 +25,18 @@ from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoS
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import Bool, Empty, Float32MultiArray
 
-# ============================================================
-# CONFIG — deve rispecchiare params/env.yaml del checkpoint (stessi
-# valori usati in position_controller_VICON_VERSION.py).
-# ============================================================
-STEP_DT = 0.04                     # 25 Hz, stessa frequenza del loop di controllo HL
-N_WAYPOINTS = 4                    # env.yaml: n_waypoints
+# Parametri dell'ambiente (come params/env.yaml del checkpoint), soglie, topic e modalita'
+STEP_DT = 0.04
+N_WAYPOINTS = 4
 
 ROOM_MIN = np.array([-1.5, -1.0, 0.1])
 ROOM_MAX = np.array([1.5, 1.0, 2.0])
-TARGET_ROOM_MARGIN = 0.8           # env.yaml: target_room_margin
+TARGET_ROOM_MARGIN = 0.8
 
 TARGET_REACH_THRESHOLD_M = 0.15
 TARGET_REACH_YAW_THRESHOLD_RAD = 0.20
 TARGET_HOLD_TIME_S = 1.2
 
-# VICON_POSE_TOPIC = "/vicon/tello_42_boosted/tello_42_boosted"
 VICON_POSE_TOPIC = "/vicon/Tello_2/Tello_2"
 ARUCO_POSE_TOPIC = "/vicon/aruco42/aruco42"
 ARUCO_TARGET_Z_OFFSET_M = 0.0
@@ -114,17 +49,15 @@ TERMINAL_POLL_TIMEOUT_S = 0.2
 
 VALID_TARGET_MODES = ("singolo", "variabile", "custom", "hover", "aruco_target")
 VALID_ADVANCE_MODES = ("manual", "auto")
-QUEUE_MODES = ("singolo", "variabile", "aruco_target")   # uniche modalita' con avanzamento/coda
+QUEUE_MODES = ("singolo", "variabile", "aruco_target")
 
 
+# Utility: angolo, campionamento di un target nella stanza, lettura non bloccante dello stdin
 def wrap_to_pi(a):
     return math.atan2(math.sin(a), math.cos(a))
 
 
 def sample_target_in_room():
-    """Campiona un target (pos, yaw) random dentro ROOM_MIN/ROOM_MAX, con
-    margine TARGET_ROOM_MARGIN dal muro. Stessa identica logica di
-    _sample_in_room() in pos_controller_env.py."""
     center = 0.5 * (ROOM_MIN + ROOM_MAX)
     half = 0.5 * (ROOM_MAX - ROOM_MIN) * TARGET_ROOM_MARGIN
     lo = center - half
@@ -137,7 +70,6 @@ def sample_target_in_room():
 
 
 def leggi_comando_terminale():
-    """Lettura NON BLOCCANTE da stdin."""
     if select.select([sys.stdin], [], [], 0)[0]:
         try:
             riga = sys.stdin.readline()
@@ -147,6 +79,7 @@ def leggi_comando_terminale():
     return None
 
 
+# Nodo: stato della coda di waypoint e I/O ROS
 class TargetHandler(Node):
     def __init__(self):
         super().__init__("target_handler")
@@ -173,21 +106,18 @@ class TargetHandler(Node):
 
         self._target_mode = target_mode
         self._advance_mode = advance_mode
-        self._num_queues = num_queues  # <= 0 = infinito
+        self._num_queues = num_queues
 
-        # -- stato coda target, protetto da _wp_lock --
         self._wp_lock = threading.Lock()
         self.wp_pos_queue = np.zeros((N_WAYPOINTS, 3))
         self.wp_yaw_queue = np.zeros(N_WAYPOINTS)
         self.wp_idx = 0
         self.hold_timer = 0.0
         self.queues_completed = 0
-        self._mission_complete = False   # num_queues raggiunto: niente piu' rigenerazioni
+        self._mission_complete = False
 
-        # -- stato hover: catturato al takeoff, None finche' non succede --
-        self._hover_target = None   # (pos: np.ndarray(3), yaw: float) oppure None
+        self._hover_target = None
 
-        # -- ultima posa nota del Tello (per hover/auto-advance) e dell'ArUco --
         self._pos_env = None
         self._yaw = None
         self._last_aruco_pos = None
@@ -195,7 +125,6 @@ class TargetHandler(Node):
 
         self._refresh_targets_locked()
 
-        # -- ROS I/O --
         self.pose_sub = self.create_subscription(PoseStamped, VICON_POSE_TOPIC, self.pose_cb, 10)
         self.aruco_sub = self.create_subscription(PoseStamped, ARUCO_POSE_TOPIC, self.aruco_cb, 10)
         self.flight_state_sub = self.create_subscription(
@@ -226,11 +155,7 @@ class TargetHandler(Node):
             "waypoint (solo target_mode in singolo/variabile E advance_mode=manual)."
         )
 
-    # ==================================================================
-    # -- generazione/aggiornamento coda target in base a target_mode.
-    # ASSUME self._wp_lock gia' acquisito dal chiamante (tranne la prima
-    # chiamata in __init__, dove nessun altro thread e' ancora attivo). --
-    # ==================================================================
+    # Generazione della coda in base a target_mode
     def _refresh_targets_locked(self):
         mode = self._target_mode
         if mode == "singolo":
@@ -262,8 +187,6 @@ class TargetHandler(Node):
                 for k in range(N_WAYPOINTS):
                     self.wp_pos_queue[k] = pos
                     self.wp_yaw_queue[k] = yaw
-            # se non ancora catturato: lascia la coda com'e', verra'
-            # riempita al prossimo fronte di flight_state (vedi flight_state_cb).
             self.wp_idx = 0
         elif mode == "aruco_target":
             pos = self._last_aruco_pos if self._last_aruco_pos is not None else (
@@ -291,12 +214,7 @@ class TargetHandler(Node):
         if self._target_mode == "hover":
             self._refresh_targets_locked()
 
-    # ==================================================================
-    # -- avanzamento coda. Valido SOLO per target_mode in QUEUE_MODES.
-    # ASSUME self._wp_lock gia' acquisito. Ritorna True se e' stato
-    # raggiunto num_queues (la richiesta di atterraggio viene pubblicata
-    # qui: questo nodo non puo' chiamare land() da solo). --
-    # ==================================================================
+    # Avanzamento della coda (manuale, da topic, automatico)
     def _advance_waypoint_locked(self, source: str) -> bool:
         if self.wp_idx < N_WAYPOINTS - 1:
             self.wp_idx += 1
@@ -348,7 +266,7 @@ class TargetHandler(Node):
     def advance_topic_cb(self, msg: Empty):
         self.advance_manual(source="console")
 
-    # -------------------- parametri a runtime --------------------
+    # Cambio parametri a runtime (valida e rigenera subito il target)
     def _on_param_change(self, params):
         from rcl_interfaces.msg import SetParametersResult
 
@@ -357,8 +275,6 @@ class TargetHandler(Node):
         new_num_queues = self._num_queues
         custom_changed = False
 
-        # limiti stanza per gli assi del target custom (stessi ROOM_MIN/ROOM_MAX
-        # usati per il campionamento random): custom_target_yaw non ha limiti.
         custom_axis_bounds = {
             "custom_target_x": (ROOM_MIN[0], ROOM_MAX[0]),
             "custom_target_y": (ROOM_MIN[1], ROOM_MAX[1]),
@@ -392,7 +308,7 @@ class TargetHandler(Node):
             self._target_mode = new_target_mode
             self._advance_mode = new_advance_mode
             self._num_queues = new_num_queues
-            self._mission_complete = False  # un cambio esplicito di parametri riabilita la missione
+            self._mission_complete = False
 
             if mode_changed and new_target_mode == "hover" and self._flying:
                 self._capture_hover_target_locked()
@@ -404,7 +320,7 @@ class TargetHandler(Node):
 
         return SetParametersResult(successful=True)
 
-    # -------------------- callback Vicon (Tello) --------------------
+    # Callback: pose Vicon (Tello e ArUco) e flight_state
     def pose_cb(self, msg: PoseStamped):
         from scipy.spatial.transform import Rotation as R
 
@@ -413,12 +329,10 @@ class TargetHandler(Node):
         self._pos_env = np.array([p.x, p.y, p.z])
         self._yaw = float(R.from_quat([q.x, q.y, q.z, q.w]).as_euler("xyz")[2])
 
-    # -------------------- callback Vicon (ArUco) --------------------
     def aruco_cb(self, msg: PoseStamped):
         p = msg.pose.position
         self._last_aruco_pos = np.array([p.x, p.y, p.z])
 
-    # -------------------- callback flight_state (vel_command_handler) --------------------
     def flight_state_cb(self, msg: Bool):
         was_flying = self._flying
         self._flying = msg.data
@@ -426,19 +340,12 @@ class TargetHandler(Node):
             with self._wp_lock:
                 self._capture_hover_target_locked()
         if not self._flying and was_flying:
-            # atterrato/reset: la prossima volta che decolla va ricatturato
             self._hover_target = None
 
-    # -------------------- loop @25Hz: aruco live, auto-advance, publish --------------------
+    # Loop periodico: ArUco live, avanzamento automatico, pubblicazione di 'targets'
     def control_loop(self):
         with self._wp_lock:
             if self._target_mode == "aruco_target" and not self._mission_complete:
-                # a differenza di singolo/variabile, qui la coda viene
-                # rinfrescata ad OGNI tick con la posizione CORRENTE del
-                # marker (resta sempre variabile), pur restando in
-                # QUEUE_MODES: avanzamento/num_queues funzionano come per
-                # le altre modalita' a coda, ma il valore del target che
-                # si insegue e' sempre quello live.
                 self._refresh_targets_locked()
 
             if (
@@ -467,6 +374,7 @@ class TargetHandler(Node):
         self.targets_pub.publish(msg)
 
 
+# Thread stdin (INVIO = avanza) e main
 def terminal_input_loop(node: TargetHandler):
     node.get_logger().info(
         "\n"

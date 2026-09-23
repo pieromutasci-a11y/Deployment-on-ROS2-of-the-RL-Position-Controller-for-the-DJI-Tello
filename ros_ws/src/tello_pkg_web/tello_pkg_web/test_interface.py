@@ -1,17 +1,9 @@
 #!/usr/bin/env python3
-"""
-Server FINTO per testare SOLO l'interfaccia web (frontend), senza ROS2,
-senza tellopy, senza drone reale. Genera uno stato simulato plausibile
-(drone che si muove in cerchio dentro la stanza, batteria che scende
-lentamente) e lo serve con lo STESSO formato JSON di position_controller_web.py.
+"""Server finto per testare SOLO il frontend web, senza ROS2, drone o torch.
 
-USO:
-    pip install fastapi "uvicorn[standard]" websockets
-    python3 mock_server.py
-    apri il browser su http://localhost:8080/static/index.html
-
-Nessuna dipendenza da rclpy/tellopy/torch: gira su qualunque macchina con
-Python 3, anche senza il container Docker.
+Espone la stessa API del nodo reale con uno stato simulato (drone che gira in cerchio a volo attivo).
+Uso: python3 test_interface.py, poi http://localhost:8080/static/index.html
+Dipendenze: fastapi, uvicorn[standard], websockets.
 """
 
 import asyncio
@@ -32,9 +24,9 @@ WEB_PORT = 8080
 ROOM_MIN = [-2.0, -2.0, 0.1]
 ROOM_MAX = [2.0, 2.0, 3.0]
 
-# -- stato finto, mutabile, condiviso tra il generatore e gli endpoint --
+# Stato finto condiviso tra generatore ed endpoint (session_state: idle | starting | flying | landing)
 mock_state = {
-    "session_state": "idle",   # idle | starting | flying | landing
+    "session_state": "idle",
     "dof_mask_mode": "full",
     "target_mode": "variabile",
     "advance_mode": "manual",
@@ -42,30 +34,28 @@ mock_state = {
     "queues_completed": 0,
     "wp_idx": 0,
     "n_waypoints": 4,
-    "custom_target": None,   # [x, y, z] impostato via /api/custom_target
+    "custom_target": None,
     "t0": time.time(),
 }
 
 
+# Snapshot simulato: giro in cerchio a volo attivo, fermo a terra altrimenti
 def generate_fake_state():
-    """Genera uno snapshot plausibile: drone che vola in cerchio a quota
-    variabile quando session_state=='flying', altrimenti fermo al centro
-    della stanza vicino al pavimento (come se fosse appena atterrato)."""
     now = time.time()
     elapsed = now - mock_state["t0"]
 
     flying = mock_state["session_state"] == "flying"
     if flying:
         radius = 1.0
-        omega = 0.4  # rad/s, velocita' angolare del giro finto
+        omega = 0.4
         x = radius * math.cos(omega * elapsed)
         y = radius * math.sin(omega * elapsed)
         z = 1.2 + 0.3 * math.sin(0.2 * elapsed)
         yaw = (omega * elapsed + math.pi / 2) % (2 * math.pi)
         if yaw > math.pi:
             yaw -= 2 * math.pi
-        roll = 8.0 * math.sin(0.5 * elapsed)     # gradi, finto
-        pitch = 5.0 * math.cos(0.3 * elapsed)     # gradi, finto
+        roll = 8.0 * math.sin(0.5 * elapsed)
+        pitch = 5.0 * math.cos(0.3 * elapsed)
         vx = -radius * omega * math.sin(omega * elapsed)
         vy = radius * omega * math.cos(omega * elapsed)
         vz = 0.3 * 0.2 * math.cos(0.2 * elapsed)
@@ -74,7 +64,7 @@ def generate_fake_state():
             target = list(mock_state["custom_target"])
         else:
             target = [1.0, -1.0, 1.5]
-        battery = max(10, 100 - int(elapsed * 0.5))  # scende lentamente
+        battery = max(10, 100 - int(elapsed * 0.5))
     else:
         x, y, z = 0.0, 0.0, 0.15
         yaw = roll = pitch = 0.0
@@ -82,9 +72,6 @@ def generate_fake_state():
         target = None
         battery = 87
 
-    # -- marker ArUco finto: si muove SEMPRE (indipendentemente da
-    # session_state/target_mode), stessa idea del nodo reale che lo
-    # sottoscrive in continuo solo per farlo vedere in scena. --
     aruco_pos = [
         1.2 * math.cos(0.25 * elapsed),
         1.2 * math.sin(0.25 * elapsed),
@@ -118,6 +105,7 @@ def generate_fake_state():
     }
 
 
+# Modelli ed endpoint REST/WebSocket (stessa API del server reale)
 class ParamsIn(BaseModel):
     dof_mask_mode: str
     target_mode: str

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Script per fare la build dell'immagine Docker
+# Build dell'immagine Docker
 
 IMAGE_NAME="ros2_tello_nn:humble"
 DOCKERFILE="Dockerfile.tellonode"

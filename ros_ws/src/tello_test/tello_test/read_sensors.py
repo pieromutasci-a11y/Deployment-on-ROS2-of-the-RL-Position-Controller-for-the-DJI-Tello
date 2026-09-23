@@ -1,47 +1,15 @@
 #!/usr/bin/env python3
-"""
-Nodo ROS2 'read_sensors' (package tello_test): NESSUN comando al drone,
-NESSUNA policy caricata — legge e stampa a terminale, periodicamente,
-esattamente le stesse sorgenti sensoriali usate da
-position_controller_VICON_VERSION.py, per verificarle PRIMA di lanciare
-il controllore vero:
+"""Nodo 'read_sensors' (tello_test): diagnostica dei sensori, nessun comando al drone e nessuna policy.
 
-  - Vicon (topic --ros-args -p vicon_pose_topic:=...): posizione,
-    quaternione, yaw derivato, proj_grav_b, lin_vel_b E ang_vel_b,
-    calcolati con la STESSA logica esatta del controllore (rotazione
-    completa dal quaternione, derivate di Eulero -> velocita' angolari
-    nel corpo, filtro passa-basso VEL_FILTER_ALPHA).
-  - djitellopy state (broadcast SDK ufficiale): batteria ('bat'), quota
-    ('h', cm), distanza ToF ('tof', cm), velocita' riportate dal drone
-    ('vgx/vgy/vgz', unita' SDK grezze).
-
-LIBRERIA: solo djitellopy. tellopy e' stata RIMOSSA da tutto il progetto:
-le due librerie non convivono sullo stesso drone (appena djitellopy entra
-in modalita' SDK con 'command', il firmware smette di alimentare il flusso
-di log binario "app" da cui tellopy leggeva il giroscopio — osservato
-sperimentalmente proprio con questo nodo). Di conseguenza le velocita'
-angolari NON vengono piu' da un giroscopio ma sono derivate dal Vicon,
-esattamente come fa ora il controllore.
-
-REGISTRAZIONE E PLOT DATI:
-I dati ricevuti durante l'esecuzione vengono salvati in memoria e, alla
-chiusura del nodo (Ctrl+C o shutdown), vengono automaticamente:
-  1. Salvati in file CSV (nella cartella specificata dal parametro output_dir).
-  2. Graficati e salvati in formato PNG ad alta risoluzione (griglia 4x2):
-       1) posizione Vicon x/y/z          2) traiettoria 3D
-       3) angoli di Eulero roll/pitch/yaw (la sorgente di ang_vel_b)
-       4) gravita' proiettata nel corpo  5) velocita' lineari (Vicon vs SDK)
-       6) ang_vel_b wx/wy/wz             7) istogramma di ang_vel_b
-       8) batteria + quota (SDK vs Vicon)
-     I pannelli 3-6-7 servono a giudicare la qualita' delle velocita'
-     angolari derivate: a drone FERMO l'istogramma (7) deve essere una
-     campana stretta attorno a 0; se e' largo, il rumore del mocap sta
-     passando in osservazione e va alzato il filtro VEL_FILTER_ALPHA.
-
-Si connette al drone via djitellopy SOLO per la telemetria (connect(),
-MAI takeoff/land/comandi di movimento): sicuro da lanciare con il drone
-a terra per controllare che tutte le fonti dati arrivino con valori
-plausibili prima di fidarsi del controllore.
+Stampa periodicamente le sorgenti usate dal controllore, da verificare prima di volare:
+  - Vicon (parametro vicon_pose_topic): posizione, quaternione, yaw, gravita' proiettata,
+    velocita' lineare e angolare nel corpo (stessa logica del controllore, filtro VEL_FILTER_ALPHA).
+  - stato djitellopy: batteria, quota, ToF, velocita' SDK.
+Connessione al drone solo per la telemetria, mai takeoff/land: sicuro con il drone a terra.
+Le velocita' angolari derivano dal Vicon, non dal giroscopio (tellopy e' stata rimossa: non convive
+con djitellopy sullo stesso drone).
+A fine sessione salva CSV e griglia 4x2 di grafici in 'output_dir'. A drone fermo l'istogramma di
+ang_vel_b deve essere stretto attorno a 0, altrimenti il rumore del mocap e' alto (alzare VEL_FILTER_ALPHA).
 """
 
 import csv
@@ -58,49 +26,40 @@ from geometry_msgs.msg import PoseStamped
 from scipy.spatial.transform import Rotation as R
 
 import matplotlib
-matplotlib.use('Agg')  # Backend non interattivo per salvataggio figure senza server X
+# matplotlib senza display (backend Agg)
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from djitellopy import Tello as DJITello
 
-# DEFAULT_VICON_POSE_TOPIC = "/vicon/tello_42_boosted/tello_42_boosted"
+# Topic, periodi, sanity check mocap e filtro velocita' (come il controllore)
 DEFAULT_VICON_POSE_TOPIC = "/vicon/Tello_2/Tello_2"
 STATUS_PRINT_PERIOD_S = 0.5
-TELEMETRY_POLL_PERIOD_S = 0.1   # frequenza di campionamento dello state djitellopy per il log
+TELEMETRY_POLL_PERIOD_S = 0.1
 
-# -- sanity check mocap, stesse soglie del controllore --
 MIN_QUAT_NORM = 0.9
 MAX_QUAT_NORM = 1.1
 MAX_PLAUSIBLE_ANG_SPEED_RADPS = 20.0
 
-# -- filtro passa-basso sulle velocita' derivate dal mocap, stesso del controllore --
 VEL_FILTER_ALPHA = 0.3
 
 
+# Trasformazioni (stesso calcolo di observation_handler): gravita' proiettata, velocita' lineare e angolare nel corpo
 def wrap_to_pi(a):
     return math.atan2(math.sin(a), math.cos(a))
 
 
 def compute_projected_gravity_b(qx, qy, qz, qw):
-    """Identica a compute_projected_gravity_b() in
-    position_controller_VICON_VERSION.py."""
     rot_world_to_body = R.from_quat([qx, qy, qz, qw]).inv()
     return rot_world_to_body.apply(np.array([0.0, 0.0, -1.0]))
 
 
 def compute_lin_vel_body(v_world: np.ndarray, qx, qy, qz, qw) -> np.ndarray:
-    """Identica a compute_lin_vel_body() in
-    position_controller_VICON_VERSION.py."""
     rot_world_to_body = R.from_quat([qx, qy, qz, qw]).inv()
     return rot_world_to_body.apply(v_world)
 
 
 def euler_rates_to_body_rates(roll_dot, pitch_dot, yaw_dot, roll, pitch) -> np.ndarray:
-    """Identica a euler_rates_to_body_rates() in
-    position_controller_VICON_VERSION.py: converte le derivate degli
-    angoli di Eulero in velocita' angolare nel frame CORPO tramite la
-    matrice cinematica T (NON una semplice rotazione R^-1).
-    Convenzione R = Rz(yaw) @ Ry(pitch) @ Rx(roll), come as_euler("xyz")."""
     sr, cr = math.sin(roll), math.cos(roll)
     sp, cp = math.sin(pitch), math.cos(pitch)
     wx = roll_dot - yaw_dot * sp
@@ -109,6 +68,7 @@ def euler_rates_to_body_rates(roll_dot, pitch_dot, yaw_dot, roll, pitch) -> np.n
     return np.array([wx, wy, wz])
 
 
+# Nodo: campioni Vicon e telemetria djitellopy, stampa periodica, log
 class SensorReader(Node):
     def __init__(self):
         super().__init__("read_sensors")
@@ -127,11 +87,9 @@ class SensorReader(Node):
 
         self.start_time = time.time()
 
-        # -- registri dati per salvataggio e plot --
         self.vicon_history = []
         self.flight_history = []
 
-        # -- stato Vicon, protetto da _vicon_lock --
         self._vicon_lock = threading.Lock()
         self.pos = None
         self.yaw = None
@@ -146,12 +104,11 @@ class SensorReader(Node):
         self.ang_vel_rejected_count = 0
         self.last_pose_wall_time = None
 
-        # -- stato telemetria drone (state djitellopy), protetto da _tello_lock --
         self._tello_lock = threading.Lock()
         self.battery_pct = None
         self.height_cm = None
         self.tof_cm = None
-        self.vg_raw = None          # (vgx, vgy, vgz) — unita' SDK grezze, NON verificate
+        self.vg_raw = None
         self.flight_data_count = 0
         self.last_flight_wall_time = None
 
@@ -183,7 +140,7 @@ class SensorReader(Node):
             f"stampa ogni {STATUS_PRINT_PERIOD_S}s. Ctrl+C per uscire."
         )
 
-    # -------------------- callback Vicon --------------------
+    # Callback Vicon: validazione del campione e velocita' derivate
     def pose_cb(self, msg: PoseStamped):
         t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         p = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
@@ -211,15 +168,11 @@ class SensorReader(Node):
             if self.prev_pos is not None and self.prev_time is not None:
                 dt = max(t - self.prev_time, 1e-3)
 
-                # -- velocita' LINEARI: differenze finite mondo -> corpo --
                 v_world = (p - self.prev_pos) / dt
                 v_body_raw = compute_lin_vel_body(v_world, q.x, q.y, q.z, q.w)
                 self.lin_vel_b = VEL_FILTER_ALPHA * v_body_raw \
                                   + (1 - VEL_FILTER_ALPHA) * self.lin_vel_b
 
-                # -- velocita' ANGOLARI: derivate di Eulero (con wrap_to_pi
-                # obbligatorio sul salto +pi/-pi) -> frame corpo via matrice
-                # cinematica. Stessa identica logica del controllore. --
                 if self.prev_euler is not None:
                     roll_dot = wrap_to_pi(roll - self.prev_euler[0]) / dt
                     pitch_dot = wrap_to_pi(pitch - self.prev_euler[1]) / dt
@@ -262,11 +215,8 @@ class SensorReader(Node):
                 "ang_vel_b_z": self.ang_vel_b[2],
             })
 
-    # -------------------- polling telemetria djitellopy --------------------
+    # Polling della telemetria djitellopy e stampa periodica
     def poll_telemetry_cb(self):
-        """Campiona lo state broadcast SDK (dict aggiornato in background
-        da djitellopy). Sostituisce le vecchie callback EVENT_LOG_DATA /
-        EVENT_FLIGHT_DATA di tellopy."""
         try:
             state = self.drone.get_current_state()
         except Exception:
@@ -296,7 +246,6 @@ class SensorReader(Node):
                 "vgx": vg[0], "vgy": vg[1], "vgz": vg[2],
             })
 
-    # -------------------- stampa periodica --------------------
     def status_cb(self):
         now = time.monotonic()
 
@@ -344,7 +293,7 @@ class SensorReader(Node):
 
         self.get_logger().info("-" * 70)
 
-    # -------------------- salvataggio CSV e grafico PLOT --------------------
+    # Salvataggio CSV e griglia di grafici 4x2 a fine sessione
     def save_data_and_plots(self):
         self.get_logger().info("Avvio salvataggio dati e generazione grafici...")
         os.makedirs(self.output_dir, exist_ok=True)
@@ -360,7 +309,6 @@ class SensorReader(Node):
             self.get_logger().warn("Nessun dato registrato durante la sessione, skip salvataggio.")
             return
 
-        # 1. Salvataggio CSV
         if self.save_csv_flag:
             if vicon_data:
                 vicon_csv = os.path.join(self.output_dir, f"sensor_vicon_{timestamp_str}.csv")
@@ -384,7 +332,6 @@ class SensorReader(Node):
                 except Exception as e:
                     self.get_logger().error(f"Errore salvataggio Tello Flight CSV: {e}")
 
-        # 2. Generazione e salvataggio Grafici PLOT
         if self.save_plot_flag:
             plot_png = os.path.join(self.output_dir, f"sensor_plots_{timestamp_str}.png")
             try:
@@ -394,7 +341,6 @@ class SensorReader(Node):
                     fontsize=16, fontweight='bold'
                 )
 
-                # Subplot 1: Vicon Position (X, Y, Z) vs Time
                 ax1 = fig.add_subplot(4, 2, 1)
                 if vicon_data:
                     t_vicon = [d["time"] for d in vicon_data]
@@ -409,7 +355,6 @@ class SensorReader(Node):
                 else:
                     ax1.set_title("Vicon Position (No Data)")
 
-                # Subplot 2: Traiettoria 3D Vicon
                 ax2 = fig.add_subplot(4, 2, 2, projection='3d')
                 if vicon_data:
                     x_v = [d["x"] for d in vicon_data]
@@ -426,7 +371,6 @@ class SensorReader(Node):
                 else:
                     ax2.set_title("Vicon 3D Trajectory (No Data)")
 
-                # Subplot 3: Angoli di Eulero (le grandezze DERIVATE per ottenere ang_vel_b)
                 ax3 = fig.add_subplot(4, 2, 3)
                 if vicon_data:
                     t_vicon = [d["time"] for d in vicon_data]
@@ -441,7 +385,6 @@ class SensorReader(Node):
                 else:
                     ax3.set_title("Vicon Euler Angles (No Data)")
 
-                # Subplot 4: Gravita' proiettata nel corpo
                 ax4 = fig.add_subplot(4, 2, 4)
                 if vicon_data:
                     t_vicon = [d["time"] for d in vicon_data]
@@ -458,7 +401,6 @@ class SensorReader(Node):
                 else:
                     ax4.set_title("Projected Gravity Body (No Data)")
 
-                # Subplot 5: Velocita' Lineare corpo (Vicon) vs vg riportate dal drone
                 ax5 = fig.add_subplot(4, 2, 5)
                 if vicon_data:
                     t_vicon = [d["time"] for d in vicon_data]
@@ -476,8 +418,6 @@ class SensorReader(Node):
                 ax5.grid(True)
                 ax5.legend(fontsize=8)
 
-                # Subplot 6: VELOCITA' ANGOLARI nel corpo, derivate dal Vicon
-                # (quelle che finiscono in osservazione alla policy)
                 ax6 = fig.add_subplot(4, 2, 6)
                 if vicon_data:
                     t_vicon = [d["time"] for d in vicon_data]
@@ -493,8 +433,6 @@ class SensorReader(Node):
                 else:
                     ax6.set_title("Body Angular Velocity (No Data)")
 
-                # Subplot 7: istogramma ang_vel — utile per giudicare il RUMORE
-                # a drone fermo (dovrebbe essere una campana stretta su 0)
                 ax7 = fig.add_subplot(4, 2, 7)
                 if vicon_data:
                     for key, lab, col in (("ang_vel_b_x", "wx", "darkred"),
@@ -510,7 +448,6 @@ class SensorReader(Node):
                 else:
                     ax7.set_title("ang_vel_b distribution (No Data)")
 
-                # Subplot 8: Batteria e Quota dallo state SDK
                 ax8 = fig.add_subplot(4, 2, 8)
                 if flight_data:
                     t_fl = [d["time"] for d in flight_data]
@@ -560,4 +497,3 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
-

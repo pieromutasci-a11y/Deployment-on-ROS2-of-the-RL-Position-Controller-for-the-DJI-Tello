@@ -1,67 +1,16 @@
 #!/usr/bin/env python3
-"""
-Nodo ROS2 'observation_handler' (package tello_pkg): possiede tutta la
-lettura Vicon, le trasformate/quaternioni e la costruzione dello spazio
-delle osservazioni (52 elementi) per la pipeline modulare del
-controllore di posizione (Percezione / Policy / Attuazione / Target).
+"""Nodo 'observation_handler' (tello_pkg): costruisce il vettore di osservazione (52) dalla posa Vicon.
 
-Non tocca MAI djitellopy: nessuna connessione al drone. Riceve:
-  - posa Vicon del Tello (VICON_POSE_TOPIC) — input primario.
-  - la coda target corrente dal topic 'targets' (pubblicato da
-    target_handler, layout documentato li').
-  - l'ultima azione della policy dal topic /tello/policy_action
-    (pubblicato da policy_handler) — serve come 'prev_action' nell'obs,
-    stesso identico ruolo che aveva self.prev_hl_action nel controllore
-    monolitico. E' un piccolo anello di retroazione (A pubblica obs, B
-    calcola l'azione e la ripubblica, A la rilegge) voluto: e' l'unico
-    modo per portare prev_action fuori dal processo della policy.
-
-CALCOLI (invariati rispetto a position_controller_VICON_VERSION.py):
-  - quaternione Vicon -> angoli di Eulero (roll, pitch, yaw =
-    as_euler("xyz")) -> derivata numerica -> velocita' angolare nel
-    frame CORPO (euler_rates_to_body_rates, NON una semplice rotazione:
-    serve la matrice cinematica degli angoli di Eulero).
-  - velocita' lineari: differenze finite mondo -> frame corpo (rotazione
-    ESATTA, quaternione completo) + filtro passa-basso VEL_FILTER_ALPHA.
-  - projected_gravity_b: rotazione del vettore gravita' mondo nel frame
-    corpo tramite l'inverso del quaternione.
-  - sanity check mocap invariati: NaN/Inf, quaternione degenere, jump
-    implausibile (posizione e velocita' angolare).
-
-INTEGRALE D'ERRORE (integral_norm nell'obs): si azzera SOLO quando
-l'INDICE del waypoint attivo (wp_idx, dal topic 'targets') cambia
-valore rispetto al messaggio precedente — non quando cambia il VALORE
-del target restando sullo stesso indice (rilevante per aruco_target,
-che aggiorna la posizione ad ogni tick restando su wp_idx invariato:
-l'integrale continua ad accumularsi come se si inseguisse lo stesso
-obiettivo concettuale).
-
-WATCHDOG VICON PERSO (due livelli, stessa filosofia del monolitico ma
-senza accesso diretto al drone):
-  - se la posa scade (> POSE_TIMEOUT_S): questo nodo smette di
-    pubblicare osservazioni fresche. La "fame di dati" a valle
-    (policy_handler prima, vel_command_handler poi) fa scattare da sola
-    il watchdog di hover gia' previsto in vel_command_handler sui
-    comandi di velocita' scaduti.
-  - se la perdita persiste oltre POSE_LOST_LAND_TIMEOUT_S (3s
-    CONSECUTIVI): pubblica anche su /tello/land_request (stesso canale
-    usato da target_handler per fine-missione), cosi'
-    vel_command_handler tratta una perdita Vicon prolungata come un
-    atterraggio vero, non solo hover.
-
-OUTPUT: topic 'observations' (std_msgs/Float32MultiArray, 52 elementi,
-stesso ordine ESATTO del vettore obs nel controllore monolitico),
-pubblicato ad ogni tick del timer interno (STEP_DT, 25Hz).
-
-REGISTRAZIONE E PLOT DATI (stesso pattern di tello_test/read_sensors.py):
-ad ogni tick di control_loop() viene salvato in memoria un campione con
-posa/velocita' del drone, target attivo (w0) e wp_idx. Alla chiusura del
-nodo (Ctrl+C o shutdown) i campioni vengono automaticamente:
-  1. Salvati in CSV (cartella data dal parametro 'output_dir').
-  2. Graficati e salvati in PNG (griglia 3x2): traiettoria 3D drone+target
-     +confini stanza, traiettoria XY dall'alto, posizione (drone vs
-     target) nel tempo, yaw (drone vs target) nel tempo, velocita'
-     lineari/angolari nel tempo, norma errore di posizione nel tempo.
+Sottoscrive la posa Vicon del Tello, la coda 'targets' (da target_handler), /tello/policy_action
+(serve come prev_action nell'osservazione) e /tello/flight_state. Nessun accesso al drone.
+Da posizione e quaternione ricava velocita' lineare e angolare nel frame corpo (differenze
+finite + filtro passa-basso), gravita' proiettata, errore verso il waypoint attivo, preview dei
+successivi, distanze dai muri e integrale d'errore leaky (azzerato al cambio di wp_idx).
+Scarta i campioni mocap non plausibili (NaN, quaternione degenere, salti).
+Watchdog Vicon: posa scaduta (POSE_TIMEOUT_S) -> smette di pubblicare (hover a valle);
+persa oltre POSE_LOST_LAND_TIMEOUT_S -> pubblica anche /tello/land_request.
+Output: 'observations' (Float32MultiArray, 52 elementi, stesso ordine del training).
+A volo attivo registra i campioni; a fine sessione salva CSV e grafici in 'output_dir'.
 """
 
 import csv
@@ -80,14 +29,12 @@ from std_msgs.msg import Bool, Empty, Float32MultiArray
 from scipy.spatial.transform import Rotation as R
 
 import matplotlib
-matplotlib.use('Agg')  # Backend non interattivo per salvataggio figure senza server X
+# matplotlib senza display (backend Agg)
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-# ============================================================
-# CONFIG — deve rispecchiare params/env.yaml del checkpoint (stessi
-# valori usati in position_controller_VICON_VERSION.py / target_handler.py).
-# ============================================================
-STEP_DT = 0.005                     # 25 Hz
+# Parametri dell'ambiente (come params/env.yaml del checkpoint), topic, timeout e soglie di plausibilita' del mocap
+STEP_DT = 0.005
 N_WAYPOINTS = 4
 WP_PREVIEW_HORIZON = 4
 INTEGRAL_TAU_S = 5.0
@@ -96,22 +43,17 @@ INTEGRAL_OBS_SCALE = 0.5
 
 ROOM_MIN = np.array([-1.5, -1.0, 0.1])
 ROOM_MAX = np.array([1.5, 1.0, 2.0])
-    
-# Stessi valori di tello_pkg/vel_command_handler.py: servono SOLO per calcolare,
-# a scopo di logging CSV, la velocita' di riferimento comandata al drone
-# (azione policy scalata + RC_SCALE_PCT), da confrontare con
-# lin_vel_b/ang_vel_b misurate. NON alimentano alcuna azione qui, e non
-# vanno tenute fuori sync rispetto a vel_command_handler.py /
-# vel_command_handler_web.py.
-VEL_REF_SCALE = np.array([1.0, 1.0, 1.0, 1.5])   # [vx,vy,vz,wz]
-RC_SCALE_PCT = np.array([0.40, 0.40, 0.40, 0.40])   # [vx,vy,vz,wz]
 
+# Stessi valori di vel_command_handler: servono solo a loggare la velocita' comandata, vanno tenuti allineati
+VEL_REF_SCALE = np.array([1.0, 1.0, 1.0, 1.5])
+RC_SCALE_PCT = np.array([0.40, 0.40, 0.40, 0.40])
+
+# Maschere dei gradi di liberta' (feature di osservazione, non maschera sull'azione)
 DOF_MASKS = {
     "full":     (1.0, 1.0, 1.0, 1.0),
     "uniciclo": (1.0, 0.0, 1.0, 1.0),
 }
 
-# VICON_POSE_TOPIC = "/vicon/tello_42_boosted/tello_42_boosted"
 VICON_POSE_TOPIC = "/vicon/Tello_2/Tello_2"
 TARGETS_TOPIC = "targets"
 POLICY_ACTION_TOPIC = "/tello/policy_action"
@@ -128,15 +70,8 @@ MIN_QUAT_NORM = 0.9
 MAX_QUAT_NORM = 1.1
 
 
+# Radice di ros_ws: colcon esegue una copia del file da build/install, quindi si risale fino a src/tello_pkg
 def _find_ros_ws_root(start_path):
-    """Risale da start_path fino a trovare ros_ws/ (riconosciuta da src/tello_pkg/).
-
-    Necessario perche' colcon esegue una COPIA di questo file da
-    ros_ws/build/... o ros_ws/install/... (non l'originale in ros_ws/src/...),
-    quindi un numero fisso di ".." non porta sempre a ros_ws/. install/, build/
-    e src/ sono pero' sempre sotto-directory dirette di ros_ws/, qualunque sia
-    la copia in esecuzione.
-    """
     d = os.path.abspath(start_path)
     for _ in range(10):
         if os.path.isdir(os.path.join(d, "src", "tello_pkg")):
@@ -147,11 +82,13 @@ def _find_ros_ws_root(start_path):
         d = parent
     return os.path.abspath(os.path.join(start_path, "..", "..", ".."))
 
+# Filtro sulle velocita' e origine del frame mocap
 VEL_FILTER_ALPHA = 0.3
 
-ORIGIN_MOCAP = np.array([0.0, 0.0, 0.0])   # <-- calibrare come nel monolitico
+ORIGIN_MOCAP = np.array([0.0, 0.0, 0.0])
 
 
+# Trasformazioni: gravita' proiettata, velocita' lineare e angolare nel frame corpo
 def wrap_to_pi(a):
     return math.atan2(math.sin(a), math.cos(a))
 
@@ -167,9 +104,6 @@ def compute_lin_vel_body(v_world: np.ndarray, qx, qy, qz, qw) -> np.ndarray:
 
 
 def euler_rates_to_body_rates(roll_dot, pitch_dot, yaw_dot, roll, pitch) -> np.ndarray:
-    """Vedi docstring identico in position_controller_VICON_VERSION.py:
-    convenzione R = Rz(yaw) @ Ry(pitch) @ Rx(roll), matrice cinematica
-    degli angoli di Eulero (NON una semplice rotazione world->body)."""
     sr, cr = math.sin(roll), math.cos(roll)
     sp, cp = math.sin(pitch), math.cos(pitch)
     wx = roll_dot - yaw_dot * sp
@@ -178,6 +112,7 @@ def euler_rates_to_body_rates(roll_dot, pitch_dot, yaw_dot, roll, pitch) -> np.n
     return np.array([wx, wy, wz])
 
 
+# Nodo: osservazione da posa Vicon, coda target e ultima azione
 class ObservationHandler(Node):
     def __init__(self):
         super().__init__("observation_handler")
@@ -193,8 +128,6 @@ class ObservationHandler(Node):
         self.start_time = time.time()
         self._history_lock = threading.Lock()
         self.history = []
-        # registrazione CSV/plot gated su flight_ready (vedi flight_state_cb):
-        # parte solo al "Avvia algoritmo", sincronizzata con vel_command_handler(_web)
         self.flight_ready = False
 
         self.declare_parameter("dof_mask_mode", "full")
@@ -203,17 +136,11 @@ class ObservationHandler(Node):
             raise ValueError(f"dof_mask_mode='{dof_mask_mode}' non valido, atteso uno tra {list(DOF_MASKS.keys())}")
         self.dof_mask = np.array(DOF_MASKS[dof_mask_mode])
 
-        # target_mode/advance_mode: SOLO informativi qui (la logica vive in
-        # target_handler), servono per nominare i file CSV/plot di questa
-        # sessione (es. observation_log_singolo_manual_<timestamp>.csv).
-        # vel_command_handler_web li rispecchia qui via set_remote_param,
-        # in aggiunta a quelli mandati a target_handler (vedi set_params()).
         self.declare_parameter("target_mode", "variabile")
         self.declare_parameter("advance_mode", "manual")
         self.target_mode = self.get_parameter("target_mode").get_parameter_value().string_value
         self.advance_mode = self.get_parameter("advance_mode").get_parameter_value().string_value
 
-        # -- stato derivato dal Vicon (aggiornato in pose_cb) --
         self.pos_env = np.zeros(3)
         self.yaw = 0.0
         self.lin_vel_b = np.zeros(3)
@@ -229,10 +156,8 @@ class ObservationHandler(Node):
         self._pose_lost_since = None
         self._land_requested_for_pose_loss = False
 
-        # -- ultima azione della policy, usata come prev_action nell'obs --
         self.prev_action = np.zeros(4)
 
-        # -- coda target ricevuta da target_handler --
         self._targets_lock = threading.Lock()
         self.wp_idx = 0
         self._last_wp_idx = None
@@ -240,11 +165,9 @@ class ObservationHandler(Node):
         self.wp_yaw_queue = np.zeros(N_WAYPOINTS)
         self.targets_received = False
 
-        # -- integrale d'errore leaky, azzerato solo su cambio wp_idx --
         self.err_integral = np.zeros(4)
         self.alpha_leaky = math.exp(-STEP_DT / INTEGRAL_TAU_S)
 
-        # -- ROS I/O --
         self.pose_sub = self.create_subscription(PoseStamped, VICON_POSE_TOPIC, self.pose_cb, 10)
         self.targets_sub = self.create_subscription(Float32MultiArray, TARGETS_TOPIC, self.targets_cb, 10)
         self.policy_action_sub = self.create_subscription(
@@ -272,7 +195,7 @@ class ObservationHandler(Node):
             f"dof_mask_mode={dof_mask_mode} | pubblico su '{OBSERVATIONS_TOPIC}'."
         )
 
-    # -------------------- parametri a runtime --------------------
+    # Parametri a runtime
     def _on_param_change(self, params):
         from rcl_interfaces.msg import SetParametersResult
 
@@ -292,7 +215,7 @@ class ObservationHandler(Node):
 
         return SetParametersResult(successful=True)
 
-    # -------------------- callback target_handler --------------------
+    # Callback: coda target, azione della policy, flight_state
     def targets_cb(self, msg: Float32MultiArray):
         data = msg.data
         if len(data) != 1 + N_WAYPOINTS * 3 + N_WAYPOINTS:
@@ -311,31 +234,23 @@ class ObservationHandler(Node):
             self.wp_yaw_queue = wp_yaw_queue
             self.targets_received = True
 
-    # -------------------- callback policy_handler --------------------
     def policy_action_cb(self, msg: Twist):
         self.prev_action = np.array([msg.linear.x, msg.linear.y, msg.linear.z, msg.angular.z])
 
-    # -------------------- callback flight_state (vel_command_handler/_web) --------------------
     def flight_state_cb(self, msg: Bool):
         was_ready = self.flight_ready
         self.flight_ready = msg.data
         if self.flight_ready and not was_ready:
-            # "Avvia algoritmo" premuto: azzero t=0 e scarto lo storico pre-volo
-            # cosi' il CSV parte sincronizzato col decollo, non col lancio del nodo.
             self.start_time = time.time()
             with self._history_lock:
                 self.history = []
             self.get_logger().info("flight_ready=True: avvio registrazione CSV/plot (sincronizzata al decollo).")
         elif was_ready and not self.flight_ready:
-            # Land: salvo SUBITO il CSV/plot di questa sessione di volo (timestamp
-            # dedicato, un file per volo) e svuoto lo storico, cosi' una nuova
-            # sessione (magari con parametri diversi) non si somma/sovrascrive
-            # a quella appena chiusa.
             self.save_data_and_plots()
             with self._history_lock:
                 self.history = []
 
-    # -------------------- callback Vicon (Tello) --------------------
+    # Callback Vicon: validazione del campione, velocita' per differenze finite filtrate, assetto
     def pose_cb(self, msg: PoseStamped):
         t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         p_world = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
@@ -400,10 +315,10 @@ class ObservationHandler(Node):
         self.pose_received = True
         self.last_pose_wall_time = time.monotonic()
 
-    # -------------------- loop @25Hz: integrale, obs, publish --------------------
+    # Loop periodico: watchdog Vicon, integrale d'errore, assemblaggio e pubblicazione dell'osservazione
     def control_loop(self):
         if self.last_pose_wall_time is None:
-            return  # Vicon mai arrivato: niente da pubblicare, nessuna escalation
+            return
 
         now_mono = time.monotonic()
         pose_age = now_mono - self.last_pose_wall_time
@@ -423,7 +338,7 @@ class ObservationHandler(Node):
         self._land_requested_for_pose_loss = False
 
         if not self.targets_received:
-            return  # target_handler non ha ancora pubblicato nessuna coda
+            return
 
         pos_env = self.pos_env
         yaw = self.yaw
@@ -462,6 +377,8 @@ class ObservationHandler(Node):
         clearance = np.concatenate([ROOM_MAX - pos_env, pos_env - ROOM_MIN])
         integral_norm = self.err_integral / INTEGRAL_OBS_SCALE
 
+        # Layout (52): pos(3) | sin,cos yaw(2) | v lineare corpo(3) | w corpo(3) | gravita' proiettata(3)
+        # | prev_action(4) | preview(20) | clearance(6) | dof_mask(4) | integrale(4)
         obs = np.concatenate([
             pos_env,
             np.array([math.sin(yaw), math.cos(yaw)]),
@@ -481,21 +398,11 @@ class ObservationHandler(Node):
         msg.data = obs.tolist()
         self.obs_pub.publish(msg)
 
-        # Logging CSV/plot SOLO mentre il volo e' attivo (flight_ready, settato da
-        # flight_state_cb al "Avvia algoritmo"): niente dati pre/post-volo nel file.
+        # Log CSV/plot solo a volo attivo
         if not self.flight_ready:
             return
 
-        # Velocita' di riferimento comandata al drone (stessa trasformazione
-        # azione->comando fatta in vel_command_handler.py: scala + RC_SCALE_PCT),
-        # espressa nella stessa unita' "nominale" usata per il comando RC
-        # (valore * 100 = percentuale stick), SOLO per logging/confronto con
-        # lin_vel_b/ang_vel_b misurate — non e' l'azione effettivamente
-        # inviata da questo processo. cmd_vel_ref e' gia' saturato al
-        # massimo fisico [1,1,1,1.5] da VEL_REF_SCALE: NESSUN clip(-1,1)
-        # ulteriore qui, altrimenti wz (max 1.5) verrebbe ritagliato
-        # scorrettamente a 1.0 come accadeva prima del fix in
-        # vel_command_handler(_web).py.
+        # Velocita' comandata, solo per logging: nessun ulteriore clip (VEL_REF_SCALE porta wz fino a 1.5)
         cmd_vel_ref = np.clip(self.prev_action, -1.0, 1.0) * VEL_REF_SCALE
         cmd_vx = float(cmd_vel_ref[0]) * RC_SCALE_PCT[0]
         cmd_vy = float(cmd_vel_ref[1]) * RC_SCALE_PCT[1]
@@ -523,8 +430,7 @@ class ObservationHandler(Node):
                 "pos_err_norm": float(np.linalg.norm(pos_err)),
             })
 
-
-    # -------------------- salvataggio CSV e grafico PLOT --------------------
+    # Salvataggio a fine sessione: CSV e griglia di grafici PNG in output_dir
     def save_data_and_plots(self):
         with self._history_lock:
             data = list(self.history)
@@ -566,7 +472,6 @@ class ObservationHandler(Node):
                     fontsize=16, fontweight="bold",
                 )
 
-                # 1: traiettoria 3D drone + target + confini stanza
                 ax1 = fig.add_subplot(3, 2, 1, projection="3d")
                 ax1.plot(x, y, z, label="Drone path", color="purple")
                 ax1.scatter(x[0], y[0], z[0], color="green", s=40, label="Start")
@@ -594,7 +499,6 @@ class ObservationHandler(Node):
                 ax1.set_title("3D Trajectory (drone vs target, room bounds)")
                 ax1.legend(fontsize=8)
 
-                # 2: traiettoria XY dall'alto, con rettangolo stanza
                 ax2 = fig.add_subplot(3, 2, 2)
                 ax2.plot(x, y, label="Drone XY", color="purple")
                 ax2.plot(tx, ty, label="Target XY", color="orange", linestyle="--")
@@ -611,7 +515,6 @@ class ObservationHandler(Node):
                 ax2.grid(True)
                 ax2.legend(fontsize=8)
 
-                # 3: posizione drone vs target nel tempo
                 ax3 = fig.add_subplot(3, 2, 3)
                 ax3.plot(t, x, label="Drone X", color="r")
                 ax3.plot(t, y, label="Drone Y", color="g")
@@ -625,7 +528,6 @@ class ObservationHandler(Node):
                 ax3.grid(True)
                 ax3.legend(fontsize=8)
 
-                # 4: yaw drone vs target + norma errore posizione
                 ax4 = fig.add_subplot(3, 2, 4)
                 ax4.plot(t, [d["yaw_deg"] for d in data], label="Drone yaw (deg)", color="b")
                 ax4.plot(t, [d["target_yaw_deg"] for d in data], label="Target yaw (deg)", color="b", linestyle=":")
@@ -640,7 +542,6 @@ class ObservationHandler(Node):
                 lines2, labels2 = ax4b.get_legend_handles_labels()
                 ax4.legend(lines1 + lines2, labels1 + labels2, fontsize=8)
 
-                # 5: velocita' lineari nel corpo
                 ax5 = fig.add_subplot(3, 2, 5)
                 ax5.plot(t, [d["lin_vel_b_x"] for d in data], label="vx misurata (m/s)", color="r")
                 ax5.plot(t, [d["lin_vel_b_y"] for d in data], label="vy misurata (m/s)", color="g")
@@ -654,7 +555,6 @@ class ObservationHandler(Node):
                 ax5.grid(True)
                 ax5.legend(fontsize=7)
 
-                # 6: velocita' angolari nel corpo
                 ax6 = fig.add_subplot(3, 2, 6)
                 ax6.plot(t, [d["ang_vel_b_x"] for d in data], label="wx (rad/s)", color="darkred")
                 ax6.plot(t, [d["ang_vel_b_y"] for d in data], label="wy (rad/s)", color="darkgreen")

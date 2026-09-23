@@ -1,38 +1,11 @@
 #!/usr/bin/env python3
-"""
-Nodo ROS2 'mission_console' (package tello_pkg): punto di controllo
-interattivo per la pipeline modulare (target_handler/observation_handler/
-policy_handler/vel_command_handler).
+"""Nodo 'mission_console' (tello_pkg): console interattiva della pipeline modulare.
 
-DA LANCIARE SEMPRE A PARTE con 'ros2 run tello_pkg mission_console' in
-un SECONDO terminale, MAI incluso in no_motors.launch.py/
-full_pipeline.launch.py: verificato empiricamente che 'ros2 launch' non
-inoltra AFFATTO lo stdin del terminale ai processi figli (nemmeno ad un
-unico processo, senza nessuna contesa) — limite noto di ROS2, stesso
-motivo per cui teleop_twist_keyboard non si lancia mai da un launch
-file. Gli altri nodi vanno quindi avviati dal launch file (che imposta
-solo i valori INIZIALI dei parametri via argomenti da riga di comando),
-e mission_console si collega da fuori per il controllo interattivo.
-
-ALL'AVVIO gira un WIZARD sequenziale (bloccante, un input() alla
-volta): chiede target_mode, advance_mode, dof_mask_mode (e le
-coordinate custom se target_mode='custom'), num_queues. Ogni risposta
-viene applicata IMMEDIATAMENTE chiamando il servizio ROS2
-'set_parameters' del nodo giusto (target_handler o observation_handler)
-— stesso identico effetto di un 'ros2 param set' fatto a mano, ma
-guidato dal wizard. INVIO vuoto ad una domanda = non modificare quel
-parametro (resta quello coi cui i nodi sono partiti, es. dagli
-argomenti del launch). L'ultimo passo del wizard e' 'start': un INVIO
-li' pubblica su /tello/start_request (il cancello di partenza di
-vel_command_handler — se non e' incluso nel launch, es. con
-no_motors.launch.py, il messaggio semplicemente non ha nessuno che lo
-ascolta e non fa nulla).
-
-DOPO il wizard, il nodo resta nel loop operativo normale:
-    INVIO (riga vuota)  -> /target_handler/advance (avanzamento waypoint)
-    l / land            -> /tello/land_request (atterraggio pulito)
-    start / s           -> /tello/start_request (nel caso serva ripetere
-                            il comando, es. dopo un takeoff fallito)
+Va lanciato a parte ('ros2 run tello_pkg mission_console', secondo terminale):
+'ros2 launch' non inoltra lo stdin ai processi figli.
+All'avvio un wizard imposta via set_parameters target_mode, advance_mode,
+dof_mask_mode, num_queues (e le coordinate se 'custom'); INVIO vuoto = non
+modificare. Poi: INVIO = avanza waypoint, l/land = atterra, start/s = decollo.
 """
 
 import sys
@@ -48,6 +21,7 @@ from std_msgs.msg import Empty
 from tello_pkg.target_handler import VALID_TARGET_MODES, VALID_ADVANCE_MODES, ROOM_MIN, ROOM_MAX
 from tello_pkg.observation_handler import DOF_MASKS
 
+# Topic, servizi e timeout
 ADVANCE_TOPIC = "/target_handler/advance"
 LAND_REQUEST_TOPIC = "/tello/land_request"
 START_REQUEST_TOPIC = "/tello/start_request"
@@ -61,6 +35,7 @@ SERVICE_CALL_TIMEOUT_S = 3.0
 DOF_MASK_MODES = tuple(DOF_MASKS.keys())
 
 
+# Nodo: publisher dei comandi e client set_parameters verso gli altri nodi
 class MissionConsole(Node):
     def __init__(self):
         super().__init__("mission_console")
@@ -72,7 +47,6 @@ class MissionConsole(Node):
         self.target_handler_client = self.create_client(SetParameters, TARGET_HANDLER_SET_PARAMS)
         self.observation_handler_client = self.create_client(SetParameters, OBSERVATION_HANDLER_SET_PARAMS)
 
-    # -------------------- comandi rapidi (loop operativo) --------------------
     def advance(self):
         self.advance_pub.publish(Empty())
         self.get_logger().info("[console] INVIO -> /target_handler/advance")
@@ -85,7 +59,6 @@ class MissionConsole(Node):
         self.start_request_pub.publish(Empty())
         self.get_logger().info("[console] start -> /tello/start_request")
 
-    # -------------------- set_parameters remoto (usato dal wizard) --------------------
     def set_remote_param(self, client, node_label: str, name: str, value) -> bool:
         if not client.wait_for_service(timeout_sec=SERVICE_WAIT_TIMEOUT_S):
             print(f"  [!] {node_label} non raggiungibile (servizio set_parameters assente), '{name}' NON impostato.")
@@ -112,22 +85,13 @@ class MissionConsole(Node):
         return True
 
 
+# Input da terminale (il prompt e' una riga completa: sotto ros2 launch un prompt senza newline non compare)
 def _input_flush(prompt: str) -> str:
-    """Stampa il prompt come RIGA COMPLETA (con newline finale) prima di
-    leggere. Necessario perche' il logging di 'ros2 launch' (quello che
-    aggiunge il prefisso '[mission_console-N]') mostra l'output dei
-    processi figli riga per riga: un prompt SENZA newline finale (come
-    farebbe un normale input(prompt) interattivo) non viene mai
-    considerato una riga completa e non compare mai, anche se il
-    processo e' gia' fermo in attesa della risposta. La risposta appare
-    quindi su una riga separata dal prompt, non sulla stessa riga."""
     print(prompt, flush=True)
     return sys.stdin.readline().strip()
 
 
 def ask(prompt: str, choices=None):
-    """Riga vuota -> None (non modificare). Se 'choices' e' dato, ri-chiede
-    finche' la risposta non e' valida."""
     while True:
         raw = _input_flush(prompt)
         if raw == "":
@@ -150,11 +114,6 @@ def ask_float(prompt: str):
 
 
 def ask_float_bounded(prompt: str, lo: float, hi: float):
-    """Come ask_float, ma ri-chiede finche' il valore non e' compreso in
-    [lo, hi] (limiti della stanza, ROOM_MIN/ROOM_MAX di target_handler) —
-    stesso controllo che target_handler applica comunque lato server,
-    ma verificato qui prima di chiamare set_parameters per un feedback
-    immediato all'utente."""
     while True:
         raw = _input_flush(prompt)
         if raw == "":
@@ -170,6 +129,7 @@ def ask_float_bounded(prompt: str, lo: float, hi: float):
         return value
 
 
+# Wizard di configurazione iniziale
 def run_setup_wizard(node: MissionConsole):
     print(
         "\n"
@@ -240,12 +200,8 @@ def run_setup_wizard(node: MissionConsole):
     )
 
 
+# Main: spin in un thread, wizard, poi loop dei comandi
 def _spin_until_shutdown(node: MissionConsole):
-    """Wrapper attorno a rclpy.spin(): quando rclpy.shutdown() viene
-    chiamato dal thread principale, spin() solleva
-    ExternalShutdownException per uscire dal wait_for_ready_callbacks
-    bloccato — atteso e innocuo (il processo termina comunque pulito),
-    ma senza catturarla stampa un traceback rumoroso su stderr."""
     try:
         rclpy.spin(node)
     except rclpy.executors.ExternalShutdownException:
@@ -274,12 +230,7 @@ def main(args=None):
     except (KeyboardInterrupt, EOFError):
         pass
     finally:
-        # ORDINE IMPORTANTE: rclpy.shutdown() PRIMA, cosi' rclpy.spin(node)
-        # nel thread di background esce da solo (context non piu' valido);
-        # poi join() per aspettare che il thread sia DAVVERO uscito; solo
-        # allora destroy_node(). Distruggere il nodo mentre spin_thread lo
-        # sta ancora usando in parallelo causa un crash a livello rcl/rclcpp
-        # ("terminate called without an active exception" osservato).
+        # Ordine obbligato: shutdown, join dello spin thread, solo poi destroy_node (altrimenti crash rcl)
         if rclpy.ok():
             rclpy.shutdown()
         spin_thread.join(timeout=2.0)

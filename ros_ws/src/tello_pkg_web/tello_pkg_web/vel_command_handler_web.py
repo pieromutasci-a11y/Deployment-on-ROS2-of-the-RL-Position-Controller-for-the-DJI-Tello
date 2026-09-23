@@ -1,55 +1,14 @@
 #!/usr/bin/env python3
-"""
-Nodo ROS2 'vel_command_handler_web' (package tello_pkg_web): equivalente
-WEB di tello_pkg/vel_command_handler.py + tello_pkg/mission_console.py,
-fusi nello stesso processo.
+"""Nodo 'vel_command_handler_web' (tello_pkg_web): vel_command_handler + mission_console fusi in un processo, con dashboard web.
 
-PERCHE' FUSI (a differenza di tello_pkg, dove sono due processi separati):
-mission_console e' un processo a parte SOLO perche' 'ros2 launch' non
-inoltra lo stdin a piu' processi figli (vedi docstring di
-tello_pkg/mission_console.py). Il server web qui dentro non ha questo
-problema (HTTP/WebSocket, non stdin): puo' quindi girare nello stesso
-'ros2 launch' di target_handler/observation_handler/policy_handler, senza
-bisogno di un secondo terminale — vedi launch/web_pipeline.launch.py. Le
-stesse identiche chiamate set_parameters usate da mission_console diventano
-qui gli handler degli endpoint REST (/api/params, /api/custom_target,
-/api/advance).
-
-RIUSO (nessuna logica duplicata/reinventata):
-  - attuazione/telemetria/watchdog/failsafe batteria/land/takeoff: portati
-    1:1 da tello_pkg/vel_command_handler.py (stessi topic, stesse costanti,
-    stesso gate esplicito su /tello/start_request — se non premi "Avvia
-    algoritmo" nella dashboard il drone non si muove).
-  - set_remote_param via servizio SetParameters: portato 1:1 da
-    tello_pkg/mission_console.py.
-  - calcoli di posa per la SOLA dashboard (pos/rpy/lin_vel_b/ang_vel_b):
-    funzioni pure IMPORTATE da tello_pkg.observation_handler
-    (compute_projected_gravity_b / compute_lin_vel_body /
-    euler_rates_to_body_rates / wrap_to_pi) — questo nodo si iscrive PER
-    CONTO SUO a VICON_POSE_TOPIC solo per popolare la dashboard web, NON
-    alimenta mai la policy (quello resta compito esclusivo di
-    observation_handler, altro processo).
-  - limiti stanza (ROOM_MIN/ROOM_MAX), target_mode/advance_mode validi,
-    ADVANCE_TOPIC: importati da tello_pkg.target_handler, stessa fonte di
-    verita' gia' usata da target_handler/mission_console (il rifiuto
-    fuori-stanza e' comunque garantito anche lato server dentro
-    target_handler._on_param_change, indipendentemente da questo nodo).
-
-NUOVO rispetto a tello_pkg_web/position_controller_web.py (monolitico,
-lasciato invariato):
-  - target_mode 'custom' esposto in dashboard: endpoint POST
-    /api/custom_target {x,y,z} valida contro ROOM_MIN/ROOM_MAX e chiama
-    set_remote_param su custom_target_x/y/z — applicabile in QUALSIASI
-    momento (non solo a sessione idle), stessa semantica "a runtime" gia'
-    prevista da target_handler (il target si aggiorna immediatamente,
-    utile per "disegnare" il target nella scena 3D mentre il drone vola).
-  - marker ArUco (ARUCO_POSE_TOPIC) sottoscritto SEMPRE, indipendentemente
-    dal target_mode attivo, e trasmesso al frontend come 'aruco_pos' cosi'
-    si vede muovere in scena anche fuori da target_mode='aruco_target'.
-
-REGISTRAZIONE DATI: stessa logica di position_controller_web.py
-(save_data_and_plots, CSV + PNG 4x2), qui alimentata dal pose_cb/telemetria
-di QUESTO nodo (che possiede la connessione djitellopy).
+Il server web (FastAPI + WebSocket, niente stdin) puo' stare nello stesso 'ros2 launch' di
+target/observation/policy handler (web_pipeline.launch.py). Attuazione, telemetria, watchdog,
+failsafe batteria e cancello di partenza su /tello/start_request sono quelli di vel_command_handler;
+le chiamate set_parameters di mission_console diventano gli endpoint REST (/api/params,
+/api/custom_target, /api/advance). /api/custom_target valida x, y, z contro ROOM_MIN/ROOM_MAX.
+Posa Vicon e marker ArUco (sempre live) servono solo alla dashboard: la policy resta alimentata
+solo da observation_handler. Limiti stanza e modalita' valide sono importati da tello_pkg.target_handler.
+A volo attivo registra i dati; a fine sessione salva CSV e grafici.
 """
 
 import csv
@@ -74,7 +33,8 @@ from std_msgs.msg import Bool, Empty, Float32MultiArray
 from scipy.spatial.transform import Rotation as R
 
 import matplotlib
-matplotlib.use('Agg')  # backend non interattivo per salvataggio figure senza server X
+# matplotlib senza display (backend Agg)
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from djitellopy import Tello as DJITello
@@ -96,21 +56,13 @@ from tello_pkg.observation_handler import (
     _find_ros_ws_root,
 )
 
-# ============================================================
-# CONFIG — stessi valori usati in tello_pkg/vel_command_handler.py
-# ============================================================
-VEL_REF_SCALE = np.array([1.0, 1.0, 1.0, 1.5])   # [vx,vy,vz,wz]
+# Scala dell'azione [-1, 1] in riferimento fisico, ordine [vx, vy, vz, wz]
+VEL_REF_SCALE = np.array([1.0, 1.0, 1.0, 1.5])
 
-# NON e' un clamp fisico in m/s: il riferimento della policy (dopo
-# VEL_REF_SCALE) e' per costruzione gia' entro i limiti fisici, quindi non
-# va tagliato. RC_SCALE_PCT scala PROPORZIONALMENTE il comando RC finale
-# (dopo la conversione riferimento -> percentuale stick in _send_vel_command):
-# un riferimento di 1.0 m/s produrrebbe RC=100 a piena autorita', con uno
-# scaler di 0.40 diventa RC=40. Un valore INDIPENDENTE per asse [vx,vy,vz,wz]
-# (stesso ordine di VEL_REF_SCALE), cosi' si puo' es. tenere vz/wz piu'
-# prudenti di vx/vy senza toccare gli altri assi.
-RC_SCALE_PCT = np.array([0.50, 0.50, 0.50, 0.90])   # [vx,vy,vz,wz]
+# Scala proporzionale del comando RC finale, un valore per asse [vx, vy, vz, wz]
+RC_SCALE_PCT = np.array([0.50, 0.50, 0.50, 0.90])
 
+# Watchdog, decollo, telemetria e failsafe batteria
 ACTION_TIMEOUT_S = 0.2
 
 PRE_TAKEOFF_SETTLE_S = 2.0
@@ -122,6 +74,7 @@ TELEMETRY_POLL_PERIOD_S = 1.0
 TELLO_LOST_LAND_TIMEOUT_S = 3.0
 BATTERY_FAILSAFE_PCT = 15
 
+# Topic e servizi ROS
 POLICY_ACTION_TOPIC = "/tello/policy_action"
 FLIGHT_STATE_TOPIC = "/tello/flight_state"
 LAND_REQUEST_TOPIC = "/tello/land_request"
@@ -132,7 +85,7 @@ OBSERVATION_HANDLER_SET_PARAMS = "/observation_handler/set_parameters"
 SERVICE_WAIT_TIMEOUT_S = 5.0
 SERVICE_CALL_TIMEOUT_S = 3.0
 
-# -- pose per la SOLA dashboard (nessun impatto sulla pipeline di controllo) --
+# Validazione della posa Vicon (solo dashboard)
 POSE_TIMEOUT_S = 0.5
 MAX_PLAUSIBLE_SPEED_MPS = 5.0
 MAX_PLAUSIBLE_ANG_SPEED_RADPS = 20.0
@@ -140,16 +93,15 @@ MIN_QUAT_NORM = 0.9
 MAX_QUAT_NORM = 1.1
 VEL_FILTER_ALPHA = 0.3
 
-STATE_BROADCAST_PERIOD_S = 0.1   # ~10Hz verso il frontend
+STATE_BROADCAST_PERIOD_S = 0.1
 
-# ============================================================
-# WEB SERVER
-# ============================================================
+# Server web
 WEB_HOST = "0.0.0.0"
 WEB_PORT = 8080
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web_static")
 
 
+# Nodo: attuazione, ruolo di mission console via HTTP, stato per la dashboard
 class VelCommandHandlerWeb(Node):
     def __init__(self):
         super().__init__("vel_command_handler_web")
@@ -157,10 +109,6 @@ class VelCommandHandlerWeb(Node):
         self.declare_parameter("enable_terminal_input", True)
         self.enable_terminal_input = self.get_parameter("enable_terminal_input").get_parameter_value().bool_value
 
-        # ros_ws/src/tello_pkg_web/tello_pkg_web/ -> risali di 3 livelli fino a ros_ws/
-        # stessa cartella di observation_handler: quello resta l'UNICA fonte di
-        # verita' per pose/target/velocita' (niente CSV Vicon duplicato qui, vedi
-        # save_data_and_plots).
         ros_ws_dir = _find_ros_ws_root(os.path.dirname(os.path.abspath(__file__)))
         default_output_dir = os.path.join(ros_ws_dir, "Results")
         self.declare_parameter("output_dir", default_output_dir)
@@ -172,7 +120,7 @@ class VelCommandHandlerWeb(Node):
         self.start_time = time.time()
         self.flight_history = []
 
-        # ---------------- attuazione djitellopy (da vel_command_handler.py) ----------------
+        # Attuazione djitellopy
         self.flight_ready = False
         self._landing_started = False
         self._shutdown_requested = False
@@ -190,10 +138,6 @@ class VelCommandHandlerWeb(Node):
         self.last_state_change_time = None
         self._state_warned = False
 
-        # IP del drone: default 192.168.10.1 (Tello in AP mode, PC connesso
-        # alla sua rete WiFi). Override via --ros-args -p tello_ip:=... se il
-        # drone e' invece in station mode (join di una rete esistente), dove
-        # l'IP e' assegnato dal router e non e' quello di fabbrica.
         self.declare_parameter("tello_ip", "192.168.16.196")
         tello_ip = self.get_parameter("tello_ip").get_parameter_value().string_value
         self.drone = DJITello(host=tello_ip)
@@ -213,31 +157,29 @@ class VelCommandHandlerWeb(Node):
         self.watchdog_timer = self.create_timer(ACTION_TIMEOUT_S, self.watchdog_cb)
         self.telemetry_timer = self.create_timer(TELEMETRY_POLL_PERIOD_S, self.telemetry_cb)
 
-        # ---------------- ruolo "mission console" via HTTP (da mission_console.py) ----------------
+        # Ruolo mission console via HTTP
         self.advance_pub = self.create_publisher(Empty, ADVANCE_TOPIC, 10)
         self.target_handler_client = self.create_client(SetParameters, TARGET_HANDLER_SET_PARAMS)
         self.observation_handler_client = self.create_client(SetParameters, OBSERVATION_HANDLER_SET_PARAMS)
 
-        # mirror locale degli ultimi parametri applicati con successo (stessi
-        # default di declare_parameter in target_handler/observation_handler)
         self._params_lock = threading.Lock()
         self.dof_mask_mode = "full"
         self.target_mode = "variabile"
         self.advance_mode = "manual"
         self.num_queues = -1
-        self.custom_target = None  # [x, y, z] correnti, None se mai impostato
+        self.custom_target = None
 
-        # ---------------- coda target (da target_handler, per la dashboard) ----------------
+        # Coda target (da target_handler, per la dashboard)
         self._targets_lock = threading.Lock()
         self.wp_idx = 0
         self._last_wp_idx = None
-        self.queues_completed = 0   # stimato localmente: +1 ad ogni wrap di wp_idx (solo display, non safety-critical)
+        self.queues_completed = 0
         self.wp_pos_queue = np.zeros((N_WAYPOINTS, 3))
         self.wp_yaw_queue = np.zeros(N_WAYPOINTS)
         self.targets_received = False
         self.targets_sub = self.create_subscription(Float32MultiArray, TARGETS_TOPIC, self.targets_cb, 10)
 
-        # ---------------- pose Vicon PER LA SOLA DASHBOARD (nessun impatto sul controllo) ----------------
+        # Posa Vicon solo per la dashboard (non alimenta la policy)
         self.pos_env = np.zeros(3)
         self.yaw = 0.0
         self.roll = 0.0
@@ -252,11 +194,11 @@ class VelCommandHandlerWeb(Node):
         self.last_pose_wall_time = None
         self.pose_sub = self.create_subscription(PoseStamped, VICON_POSE_TOPIC, self.pose_cb, 10)
 
-        # ---------------- marker ArUco, SEMPRE live (indipendente da target_mode) ----------------
+        # Marker ArUco sempre live, indipendente da target_mode
         self.last_aruco_pos = None
         self.aruco_sub = self.create_subscription(PoseStamped, ARUCO_POSE_TOPIC, self.aruco_cb, 10)
 
-        # ---------------- stato condiviso col server web ----------------
+        # Stato condiviso col server web
         self._state_lock = threading.Lock()
         self._latest_state = {}
         self.state_timer = self.create_timer(STATE_BROADCAST_PERIOD_S, self._update_latest_state)
@@ -269,9 +211,7 @@ class VelCommandHandlerWeb(Node):
             f"Vicon '{VICON_POSE_TOPIC}', ArUco '{ARUCO_POSE_TOPIC}'."
         )
 
-    # ==================================================================
-    # -- attuazione (invariata da vel_command_handler.py) --
-    # ==================================================================
+    # Attuazione: azione, watchdog, richieste, telemetria, sequenze di volo
     def _publish_flight_state(self):
         msg = Bool()
         msg.data = self.flight_ready
@@ -366,8 +306,6 @@ class VelCommandHandlerWeb(Node):
         with self._tello_lock:
             self.battery_pct = battery
             self.tello_alt_cm = height_cm
-            # logging CSV/plot SOLO durante il volo (flight_ready), sincronizzato
-            # con observation_handler: niente dati pre/post-volo nel file.
             if state and self.flight_ready:
                 t_rel = time.time() - self.start_time
                 self.flight_history.append({
@@ -408,9 +346,6 @@ class VelCommandHandlerWeb(Node):
 
         self._landing_started = False
         self.flight_ready = True
-        # sincronizza il logging con observation_handler (che si aggancia allo
-        # stesso evento via FLIGHT_STATE_TOPIC): t=0 al decollo, niente dati
-        # pre-volo nel CSV.
         self.start_time = time.time()
         with self._tello_lock:
             self.flight_history = []
@@ -446,17 +381,6 @@ class VelCommandHandlerWeb(Node):
             self.get_logger().error(f"Errore azzerando i comandi rc via djitellopy: {e}")
 
     def _send_vel_command(self, vx, vy, vz, wz):
-        # La SATURAZIONE vera avviene una volta sola, a monte, in
-        # policy_action_cb: action clampata [-1,1] * VEL_REF_SCALE, quindi
-        # [vx,vy,vz,wz] sono gia' bloccati entro i massimi fisici
-        # [1,1,1,1.5]. Qui NON si risatura piu': si normalizza ogni asse
-        # rispetto al proprio massimo (VEL_REF_SCALE) cosi' che "al valore
-        # massimo fisico" corrisponda sempre "100% di stick" prima della
-        # percentuale — altrimenti wz (max 1.5) verrebbe ritagliato
-        # scorrettamente a 1.0 da un clip(-1,1) fisso. RC_SCALE_PCT scala
-        # PROPORZIONALMENTE il comando finale, con un fattore INDIPENDENTE
-        # per asse (es. vx al suo massimo -> RC=100 a piena autorita', con
-        # RC_SCALE_PCT[0]=0.4 diventa RC=40).
         forward_backward = int(round(np.clip(vx / VEL_REF_SCALE[0], -1.0, 1.0) * 100 * RC_SCALE_PCT[0]))
         left_right = int(round(np.clip(-vy / VEL_REF_SCALE[1], -1.0, 1.0) * 100 * RC_SCALE_PCT[1]))
         up_down = int(round(np.clip(vz / VEL_REF_SCALE[2], -1.0, 1.0) * 100 * RC_SCALE_PCT[2]))
@@ -486,10 +410,6 @@ class VelCommandHandlerWeb(Node):
             except Exception:
                 pass
 
-        # Salvo SUBITO il CSV/plot di questa sessione di volo (timestamp dedicato,
-        # un file per volo, sincronizzato con observation_handler) e svuoto lo
-        # storico: una nuova sessione (magari con parametri diversi) non si
-        # somma/sovrascrive a quella appena chiusa.
         try:
             self.save_data_and_plots()
         except Exception as e:
@@ -497,7 +417,7 @@ class VelCommandHandlerWeb(Node):
         with self._tello_lock:
             self.flight_history = []
 
-        self._landing_started = False  # pronto per un nuovo volo, connessione resta viva
+        self._landing_started = False
 
     def emergency_land(self, reason: str = "richiesta manuale"):
         self.get_logger().error(f"[EMERGENZA] Atterraggio forzato: {reason}")
@@ -520,9 +440,7 @@ class VelCommandHandlerWeb(Node):
             return "flying"
         return "idle"
 
-    # ==================================================================
-    # -- ruolo "mission console": set_parameters remoto (da mission_console.py) --
-    # ==================================================================
+    # Ruolo mission console: set_parameters remoto
     def set_remote_param(self, client, node_label: str, name: str, value) -> bool:
         if not client.wait_for_service(timeout_sec=SERVICE_WAIT_TIMEOUT_S):
             self.get_logger().error(f"{node_label} non raggiungibile (servizio set_parameters assente), '{name}' NON impostato.")
@@ -564,8 +482,6 @@ class VelCommandHandlerWeb(Node):
         ok_tm = self.set_remote_param(self.target_handler_client, "target_handler", "target_mode", target_mode)
         ok_am = self.set_remote_param(self.target_handler_client, "target_handler", "advance_mode", advance_mode)
         ok_nq = self.set_remote_param(self.target_handler_client, "target_handler", "num_queues", num_queues)
-        # Rispecchiati anche su observation_handler (solo informativi la',
-        # servono per nominare i CSV/plot di quella sessione).
         ok_tm_obs = self.set_remote_param(self.observation_handler_client, "observation_handler", "target_mode", target_mode)
         ok_am_obs = self.set_remote_param(self.observation_handler_client, "observation_handler", "advance_mode", advance_mode)
         if not (ok_dof and ok_tm and ok_am and ok_nq and ok_tm_obs and ok_am_obs):
@@ -582,12 +498,6 @@ class VelCommandHandlerWeb(Node):
         return True, "Parametri impostati."
 
     def set_custom_target(self, x: float, y: float, z: float):
-        """Applicabile in QUALSIASI momento (non solo a sessione idle):
-        stessa semantica 'a runtime' di target_handler (il target si
-        aggiorna immediatamente). Il rifiuto fuori-stanza e' comunque
-        garantito anche lato server in target_handler._on_param_change;
-        qui il controllo e' ripetuto solo per un messaggio d'errore
-        immediato senza fare nessuna chiamata parziale."""
         for name, v, lo, hi in (
             ("x", x, ROOM_MIN[0], ROOM_MAX[0]),
             ("y", y, ROOM_MIN[1], ROOM_MAX[1]),
@@ -609,9 +519,7 @@ class VelCommandHandlerWeb(Node):
     def advance(self):
         self.advance_pub.publish(Empty())
 
-    # ==================================================================
-    # -- coda target (da target_handler, per la dashboard) --
-    # ==================================================================
+    # Coda target
     def targets_cb(self, msg: Float32MultiArray):
         data = msg.data
         if len(data) != 1 + N_WAYPOINTS * 3 + N_WAYPOINTS:
@@ -628,9 +536,7 @@ class VelCommandHandlerWeb(Node):
             self.wp_yaw_queue = wp_yaw_queue
             self.targets_received = True
 
-    # ==================================================================
-    # -- pose Vicon PER LA SOLA DASHBOARD (nessun impatto sul controllo) --
-    # ==================================================================
+    # Pose Vicon e ArUco per la dashboard
     def pose_cb(self, msg: PoseStamped):
         t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         p_world = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
@@ -677,18 +583,12 @@ class VelCommandHandlerWeb(Node):
         self.last_pose_wall_time = time.monotonic()
 
     def aruco_cb(self, msg: PoseStamped):
-        """Aggiorna SEMPRE self.last_aruco_pos, indipendentemente dal
-        target_mode attivo: serve solo a far vedere il marker muoversi
-        nella scena 3D (richiesta esplicita di visualizzazione), il suo
-        uso come TARGET vero resta compito esclusivo di target_handler."""
         p = msg.pose.position
         if any(math.isnan(v) or math.isinf(v) for v in (p.x, p.y, p.z)):
             return
         self.last_aruco_pos = [p.x, p.y, p.z]
 
-    # ==================================================================
-    # -- salvataggio CSV/PLOT (identico a position_controller_web.py) --
-    # ==================================================================
+    # Salvataggio CSV e grafici a fine sessione
     def save_data_and_plots(self):
         self.get_logger().info("Avvio salvataggio dati e generazione grafici...")
         os.makedirs(self.output_dir, exist_ok=True)
@@ -703,10 +603,6 @@ class VelCommandHandlerWeb(Node):
             self.get_logger().warn("Nessun dato registrato durante la sessione, skip salvataggio.")
             return
 
-        # Pose/target/velocita' (Vicon) sono gia' registrati da observation_handler
-        # (observation_log_*.csv nella stessa cartella Results): qui si salva SOLO la
-        # telemetria che arriva unicamente da questo nodo via djitellopy (batteria,
-        # stato volo, letture SDK raw), per evitare CSV/plot duplicati.
         if self.save_csv_flag:
             flight_csv = os.path.join(self.output_dir, f"sensor_tello_flight_{run_tag}_{timestamp_str}.csv")
             try:
@@ -750,9 +646,7 @@ class VelCommandHandlerWeb(Node):
             except Exception as e:
                 self.get_logger().error(f"Errore durante il plot dei grafici: {e}")
 
-    # ==================================================================
-    # -- stato per il frontend (WebSocket), aggiornato a ~10Hz --
-    # ==================================================================
+    # Stato per il frontend (WebSocket, ~10 Hz)
     def _update_latest_state(self):
         with self._targets_lock:
             wp_idx = self.wp_idx
@@ -806,9 +700,7 @@ class VelCommandHandlerWeb(Node):
         with self._state_lock:
             return dict(self._latest_state)
 
-    # ==================================================================
-    # -- server web (FastAPI + uvicorn), gira in un thread separato --
-    # ==================================================================
+    # Server web (FastAPI + uvicorn) in un thread separato
     def _run_web_server(self):
         node_ref = self
 
@@ -873,6 +765,7 @@ class VelCommandHandlerWeb(Node):
         uvicorn.run(app, host=WEB_HOST, port=WEB_PORT, log_level="warning")
 
 
+# Thread stdin e main
 def terminal_input_loop(node: VelCommandHandlerWeb):
     import select
     import sys

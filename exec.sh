@@ -1,5 +1,5 @@
 #!/bin/bash
-# Script per accedere al container Docker attivo in una nuova shell bash
+# Apre una nuova shell nel container attivo
 
 CONTAINER_NAME="ros2_tello_node"
 

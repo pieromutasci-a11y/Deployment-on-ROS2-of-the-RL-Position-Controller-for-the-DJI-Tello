@@ -1,46 +1,12 @@
 #!/usr/bin/env python3
-"""
-Nodo ROS2 'vel_command_handler' (package tello_pkg): UNICO nodo della
-pipeline modulare (Percezione / Policy / Attuazione / Target) con una
-connessione djitellopy reale al drone. Nessun altro nodo puo' averne
-una in parallelo: djitellopy occupa le porte fisse 8889 (comandi) e
-8890 (stato) sullo stesso host, quindi una sola istanza Tello() puo'
-esistere per volta (stesso motivo per cui tello_test non puo' girare
-insieme a questa pipeline).
+"""Nodo 'vel_command_handler' (tello_pkg): attuazione, unico nodo con connessione djitellopy al drone.
 
-CANCELLO DI PARTENZA: connect_sequence() (chiamata all'avvio del nodo)
-si limita a connettersi al drone e leggere la telemetria iniziale — NON
-decolla. Il takeoff vero parte SOLO alla ricezione di un segnale su
-/tello/start_request (Empty), tipicamente pubblicato da mission_console
-digitando 'start' nel terminale del launch, o dal proprio thread
-stdin (comando 'start'/'s') se lanciato standalone con 'ros2 run'. Cosi'
-si puo' lanciare l'intera pipeline, controllare batteria/parametri, e
-decidere esplicitamente quando far decollare il drone.
-
-RESPONSABILITA':
-  - connessione/takeoff/land tramite djitellopy.
-  - riceve /tello/policy_action (Twist, azione GREZZA clampata [-1,1]
-    da policy_handler) e la converte in comando reale al drone:
-    VEL_REF_SCALE -> *100 -> *RC_SCALE_PCT -> send_rc_control. Il
-    riferimento della policy NON viene piu' clampato in m/s: e' gia' entro
-    i limiti fisici per costruzione; RC_SCALE_PCT (uno per asse [vx,vy,vz,wz])
-    scala PROPORZIONALMENTE il comando finale (es. 1.0 m/s di riferimento
-    su vx -> RC=100 a piena autorita', con RC_SCALE_PCT[0]=0.4 diventa
-    RC=40). NESSUN mascheramento dof_mask qui: la
-    policy ha gia' imparato a non generare vy in uniciclo (dof_mask e'
-    SOLO una feature di osservazione, mai un hard mask sull'azione:
-    vedi memoria feedback_dof_mask_observation_only).
-  - legge la telemetria (batteria/quota) dallo state djitellopy, la
-    pubblica su /tello/flight_state, applica il failsafe batteria.
-  - ascolta /tello/land_request (Empty, pubblicato da target_handler a
-    fine missione E da observation_handler su perdita Vicon prolungata)
-    e lo tratta come un trigger di atterraggio equivalente a Ctrl+C.
-  - watchdog: se /tello/policy_action non arriva da oltre
-    ACTION_TIMEOUT_S, forza hover (stick a zero) finche' non riprende.
-  - Ctrl+C-deve-SEMPRE-atterrare: stesso pattern robusto gia' usato in
-    takeoff_land.py/position_controller_VICON_VERSION.py
-    (signal_handler_options=NO + handler SIGINT custom + fallback
-    incondizionato in finally).
+Converte /tello/policy_action (Twist, azione clampata [-1, 1]) in comandi RC:
+VEL_REF_SCALE -> x100 -> RC_SCALE_PCT -> send_rc_control (nessun dof_mask sull'azione).
+Cancello di partenza: all'avvio si connette e legge la telemetria, ma decolla solo su
+/tello/start_request. Pubblica /tello/flight_state; atterra su /tello/land_request, batteria
+sotto soglia o Ctrl+C. Watchdog: senza azioni per ACTION_TIMEOUT_S forza l'hover.
+Una sola istanza djitellopy per host (porte 8889/8890): non convive con tello_test.
 """
 
 import math
@@ -60,22 +26,14 @@ from std_msgs.msg import Bool, Empty
 
 from djitellopy import Tello as DJITello
 
-# ============================================================
-# CONFIG — stessi valori usati in position_controller_VICON_VERSION.py
-# ============================================================
-VEL_REF_SCALE = np.array([1.0, 1.0, 1.0, 1.5])   # [vx,vy,vz,wz]: target_lin_vel_*_scale/target_yaw_vel_scale
+# Scala dell'azione [-1, 1] in riferimento fisico, ordine [vx, vy, vz, wz]
+VEL_REF_SCALE = np.array([1.0, 1.0, 1.0, 1.5])
 
-# NON e' un clamp fisico in m/s: il riferimento della policy (dopo
-# VEL_REF_SCALE) e' per costruzione gia' entro i limiti fisici, quindi non
-# va tagliato. RC_SCALE_PCT scala PROPORZIONALMENTE il comando RC finale
-# (dopo la conversione riferimento -> percentuale stick in _send_vel_command):
-# un riferimento di 1.0 m/s produrrebbe RC=100 a piena autorita', con uno
-# scaler di 0.4 diventa RC=40. Un valore INDIPENDENTE per asse [vx,vy,vz,wz]
-# (stesso ordine di VEL_REF_SCALE), cosi' si puo' es. tenere vz/wz piu'
-# prudenti di vx/vy senza toccare gli altri assi.
-RC_SCALE_PCT = np.array([0.40, 0.40, 0.40, 0.40])   # [vx,vy,vz,wz]
+# Scala proporzionale del comando RC finale, un valore per asse [vx, vy, vz, wz] (1.0 = piena autorita')
+RC_SCALE_PCT = np.array([0.40, 0.40, 0.40, 0.40])
 
-ACTION_TIMEOUT_S = 0.2             # 5 cicli @25Hz: oltre questo, hover forzato
+# Watchdog, decollo, telemetria e failsafe batteria
+ACTION_TIMEOUT_S = 0.2
 
 PRE_TAKEOFF_SETTLE_S = 2.0
 POST_TAKEOFF_SETTLE_S = 3.0
@@ -89,12 +47,14 @@ BATTERY_FAILSAFE_PCT = 15
 STATUS_PRINT_PERIOD_S = 1.0
 TERMINAL_POLL_TIMEOUT_S = 0.2
 
+# Topic
 POLICY_ACTION_TOPIC = "/tello/policy_action"
 FLIGHT_STATE_TOPIC = "/tello/flight_state"
 LAND_REQUEST_TOPIC = "/tello/land_request"
 START_REQUEST_TOPIC = "/tello/start_request"
 
 
+# Input da terminale (non bloccante)
 def leggi_comando_terminale():
     if select.select([sys.stdin], [], [], 0)[0]:
         try:
@@ -105,6 +65,7 @@ def leggi_comando_terminale():
     return None
 
 
+# Nodo: connessione al drone, sottoscrizioni e timer
 class VelCommandHandler(Node):
     def __init__(self):
         super().__init__("vel_command_handler")
@@ -129,10 +90,7 @@ class VelCommandHandler(Node):
         self.last_state_change_time = None
         self._state_warned = False
 
-        # IP del drone: default 192.168.10.1 (Tello in AP mode, PC connesso
-        # alla sua rete WiFi). Override via --ros-args -p tello_ip:=... se il
-        # drone e' invece in station mode (join di una rete esistente), dove
-        # l'IP e' assegnato dal router e non e' quello di fabbrica.
+        # IP del drone via parametro tello_ip (Tello in AP mode: 192.168.10.1)
         self.declare_parameter("tello_ip", "192.168.16.196")
         tello_ip = self.get_parameter("tello_ip").get_parameter_value().string_value
         self.drone = DJITello(host=tello_ip)
@@ -169,7 +127,7 @@ class VelCommandHandler(Node):
         msg.data = self.flight_ready
         self.flight_state_pub.publish(msg)
 
-    # -------------------- ricezione azione dalla policy --------------------
+    # Azione dalla policy e watchdog di azione scaduta (hover forzato)
     def policy_action_cb(self, msg: Twist):
         with self._action_lock:
             self.last_action = np.array([msg.linear.x, msg.linear.y, msg.linear.z, msg.angular.z])
@@ -179,11 +137,10 @@ class VelCommandHandler(Node):
             return
 
         action = np.clip(self.last_action, -1.0, 1.0)
-        target_vel_ref = action * VEL_REF_SCALE  # [vx,vy,vz,wz] frame corpo, m/s e rad/s
+        target_vel_ref = action * VEL_REF_SCALE
         vx, vy, vz, wz = (float(v) for v in target_vel_ref)
         self._send_vel_command(vx, vy, vz, wz)
 
-    # -------------------- watchdog azione scaduta --------------------
     def watchdog_cb(self):
         if not self.flight_ready or self._shutdown_requested:
             return
@@ -196,14 +153,13 @@ class VelCommandHandler(Node):
         if age > ACTION_TIMEOUT_S:
             self._send_stick_zero()
 
-    # -------------------- land_request (target_handler / observation_handler) --------------------
+    # Richiesta di atterraggio e cancello di partenza (start_request)
     def land_request_cb(self, msg: Empty):
         self.get_logger().warn("[land_request] Richiesta di atterraggio ricevuta da un nodo a valle.")
         threading.Thread(
             target=self.emergency_land, args=("land_request esterno",), daemon=True
         ).start()
 
-    # -------------------- start_request: cancello di partenza --------------------
     def start_request_cb(self, msg: Empty):
         if not self.connected:
             self.get_logger().warn("[start_request] Drone non ancora connesso, richiesta ignorata.")
@@ -224,7 +180,7 @@ class VelCommandHandler(Node):
         finally:
             self._takeoff_in_progress = False
 
-    # -------------------- TELEMETRIA (batteria/quota) --------------------
+    # Telemetria (batteria, quota) e failsafe
     def telemetry_cb(self):
         self._poll_djitellopy_state()
 
@@ -289,9 +245,7 @@ class VelCommandHandler(Node):
             f"ultima policy_action={age_str}"
         )
 
-    # ==================================================================
-    # -- CONNESSIONE (senza takeoff): chiamata all'avvio del nodo --
-    # ==================================================================
+    # Sequenze di volo: connessione, decollo, comandi RC, atterraggio
     def connect_sequence(self) -> bool:
         self.get_logger().info("[djitellopy] connessione al drone (comandi/rc)...")
         try:
@@ -310,10 +264,6 @@ class VelCommandHandler(Node):
         )
         return True
 
-    # ==================================================================
-    # -- TAKEOFF / LAND tramite djitellopy. takeoff_sequence() e' chiamata
-    # SOLO da start_request_cb (cancello di partenza), mai in automatico. --
-    # ==================================================================
     def takeoff_sequence(self) -> bool:
         self.get_logger().info(
             f"[djitellopy] start_request ricevuto: assestamento {PRE_TAKEOFF_SETTLE_S}s prima del takeoff..."
@@ -327,10 +277,6 @@ class VelCommandHandler(Node):
             self.get_logger().error(f"[djitellopy] comando takeoff fallito: {e}")
             return False
 
-        # SICUREZZA: il drone e' fisicamente in volo da qui in poi (takeoff()
-        # ha gia' ricevuto un "ok"). flight_ready va marcato SUBITO, PRIMA
-        # della conferma quota sotto: se la conferma fallisse, il drone
-        # resterebbe comunque considerato in volo e verra' SEMPRE atterrato.
         self._landing_started = False
         self.flight_ready = True
         self._publish_flight_state()
@@ -369,21 +315,6 @@ class VelCommandHandler(Node):
             self.get_logger().error(f"Errore azzerando i comandi rc via djitellopy: {e}")
 
     def _send_vel_command(self, vx, vy, vz, wz):
-        """Converte [vx,vy,vz,wz] (m/s, rad/s, frame corpo FLU) in valori rc
-        -100..100 (NON una conversione cm/s calibrata: send_rc_control
-        accetta solo deflessione stick -100..100, senza corrispondenza
-        fisica dichiarata dall'SDK).
-        La SATURAZIONE vera avviene una volta sola, a monte, in
-        policy_action_cb: action clampata [-1,1] * VEL_REF_SCALE, quindi
-        [vx,vy,vz,wz] sono gia' bloccati entro i massimi fisici [1,1,1,1.5].
-        Qui NON si risatura piu': si normalizza ogni asse rispetto al
-        proprio massimo (VEL_REF_SCALE) cosi' che "al valore massimo
-        fisico" corrisponda sempre "100% di stick" prima della percentuale
-        — altrimenti wz (max 1.5) verrebbe ritagliato scorrettamente a 1.0
-        da un clip(-1,1) fisso. RC_SCALE_PCT scala PROPORZIONALMENTE il
-        comando finale, con un fattore INDIPENDENTE per asse (es. vx al suo
-        massimo -> RC=100 a piena autorita', con RC_SCALE_PCT[0]=0.4
-        diventa RC=40). Scelta esplicita dell'utente, DA VALIDARE IN VOLO."""
         forward_backward = int(round(np.clip(vx / VEL_REF_SCALE[0], -1.0, 1.0) * 100 * RC_SCALE_PCT[0]))
         left_right = int(round(np.clip(-vy / VEL_REF_SCALE[1], -1.0, 1.0) * 100 * RC_SCALE_PCT[1]))
         up_down = int(round(np.clip(vz / VEL_REF_SCALE[2], -1.0, 1.0) * 100 * RC_SCALE_PCT[2]))
@@ -425,6 +356,7 @@ class VelCommandHandler(Node):
         self.land_sequence()
 
 
+# Thread stdin e main (SIGINT custom: atterra sempre)
 def terminal_input_loop(node: VelCommandHandler):
     node.get_logger().info(
         "\n"
@@ -453,9 +385,6 @@ def terminal_input_loop(node: VelCommandHandler):
 
 
 def main(args=None):
-    # signal_handler_options=NO: gestiamo NOI il SIGINT (rclpy di default puo'
-    # "assorbire" il Ctrl+C internamente senza sollevare KeyboardInterrupt,
-    # facendo si' che rclpy.spin() ritorni senza che l'atterraggio parta mai).
     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     node = VelCommandHandler()
 

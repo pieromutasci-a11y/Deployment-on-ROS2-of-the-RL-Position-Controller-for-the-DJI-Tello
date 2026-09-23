@@ -1,39 +1,13 @@
 #!/usr/bin/env python3
-"""
-Lancia TUTTA la pipeline modulare: target_handler, observation_handler,
-policy_handler, vel_command_handler (UNICA connessione djitellopy al
-drone).
+"""Lancia l'intera pipeline modulare: target_handler, observation_handler, policy_handler, vel_command_handler.
 
-CANCELLO DI PARTENZA: vel_command_handler si CONNETTE al drone appena
-parte (per leggere batteria/stato), ma NON decolla da solo — aspetta un
-comando esplicito 'start'.
+vel_command_handler si connette al drone all'avvio ma decolla solo su /tello/start_request.
+mission_console non e' incluso: 'ros2 launch' non inoltra lo stdin ai processi figli. Va lanciato in
+un secondo terminale ('ros2 run tello_pkg mission_console'): start/s decolla, INVIO avanza il waypoint,
+l/land atterra. Ctrl+C nel terminale del launch atterra sempre (a terra e' innocuo).
+Per lo stesso motivo target_handler e vel_command_handler partono con enable_terminal_input=false.
 
-mission_console NON e' incluso in questo launch: 'ros2 launch' NON
-inoltra lo stdin del terminale ai processi figli (limite noto di ROS2,
-verificato empiricamente — nessun input digitato arriva ai nodi lanciati
-cosi', nemmeno ad un unico processo senza contesa). Per il controllo
-interattivo (wizard di configurazione, decollo, avanzamento manuale
-waypoint, atterraggio), apri un SECONDO terminale nello stesso
-container e lancia:
-
-    ros2 run tello_pkg mission_console
-
-Da li' funzionano tutti i comandi:
-    start / s   -> il drone decolla (/tello/start_request)
-    INVIO       -> avanza waypoint (/target_handler/advance)
-    l / land    -> atterraggio pulito (/tello/land_request)
-    Ctrl+C (in QUESTO terminale, quello del launch) -> propaga SIGINT a
-                   tutti i processi figli; vel_command_handler ha il suo
-                   handler robusto che atterra SEMPRE, anche se non e'
-                   mai decollato (land_sequence() e' innocua a terra).
-
-target_handler e vel_command_handler vengono lanciati con
-enable_terminal_input=false: il loro thread stdin interno non
-servirebbe comunque a nulla sotto 'ros2 launch' (stesso limite),
-resta spento per evitare log/thread inutili.
-
-Esempio:
-    ros2 launch tello_pkg full_pipeline.launch.py target_mode:=hover advance_mode:=auto
+Esempio: ros2 launch tello_pkg full_pipeline.launch.py target_mode:=hover advance_mode:=auto
 """
 
 from launch import LaunchDescription
@@ -49,6 +23,7 @@ def generate_launch_description():
     dof_mask_mode = LaunchConfiguration("dof_mask_mode")
 
     return LaunchDescription([
+        # Argomenti di lancio: valori iniziali dei parametri dei nodi
         DeclareLaunchArgument("target_mode", default_value="variabile",
                                description="singolo | variabile | custom | hover | aruco_target"),
         DeclareLaunchArgument("advance_mode", default_value="manual",
@@ -58,6 +33,7 @@ def generate_launch_description():
         DeclareLaunchArgument("dof_mask_mode", default_value="full",
                                description="full | uniciclo"),
 
+        # Nodi della pipeline
         Node(
             package="tello_pkg",
             executable="target_handler",

@@ -1,11 +1,10 @@
-# Base Image ROS2 Humble
+# Base: ROS2 Humble
 FROM ros:humble-ros-base
 
-# Previene prompt interattivi durante l'installazione di apt
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
-# Installazione dipendenze di sistema, pacchetti video FFmpeg e strumenti di sviluppo
+# Dipendenze di sistema, FFmpeg e strumenti di sviluppo
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     python3-dev \
@@ -28,10 +27,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Aggiornamento pip e setuptools
+# pip aggiornato
 RUN python3 -m pip install --upgrade pip setuptools wheel
 
-# Installazione librerie di base per Reti Neurali & Machine Learning (PyTorch, Numpy, SciPy, skrl, ONNX)
+# Python: PyTorch, NumPy/SciPy, skrl, ONNX
 RUN python3 -m pip install --no-cache-dir \
     torch \
     torchvision \
@@ -44,27 +43,19 @@ RUN python3 -m pip install --no-cache-dir \
     onnxruntime \
     skrl
 
-# Installazione librerie per l'interfaccia web del position_controller
-# (FastAPI + uvicorn con supporto WebSocket per lo stato in tempo reale
-# del drone, servito nello stesso processo del nodo ROS2).
+# Python: interfaccia web (FastAPI + uvicorn/WebSocket)
 RUN python3 -m pip install --no-cache-dir \
     fastapi \
     "uvicorn[standard]" \
     websockets
 
-# Installazione librerie per Drone Tello usate nel progetto:
-# - djitellopy (UNICA libreria drone: comandi, rc control, telemetria SDK)
-#   tellopy/TelloPy RIMOSSA: non convive con djitellopy sullo stesso drone
-#   (entrando in modalita' SDK il firmware smette di alimentare il flusso
-#   di log binario "app" da cui tellopy leggeva il giroscopio).
-# - av (PyAV per decodifica video H.264 dallo socket UDP del Tello)
-# - opencv-python-headless (per elaborazione frame immagini)
+# Python: Tello (djitellopy e' l'unica libreria drone: tellopy non convive con essa), PyAV, OpenCV
 RUN python3 -m pip install --no-cache-dir \
     djitellopy \
     av \
     opencv-python-headless
 
-# Installazione pacchetti ROS2 supplementari
+# Pacchetti ROS2 supplementari
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-humble-cv-bridge \
     ros-humble-vision-opencv \
@@ -76,22 +67,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-humble-tf2-geometry-msgs \
     && rm -rf /var/lib/apt/lists/*
 
-# Configurazione del workspace ROS2
+# Workspace e sourcing automatico di ROS2
 WORKDIR /ros_workspace
 
-# Sourcing automatico dell'ambiente ROS2 Humble in bash
 RUN echo "source /opt/ros/humble/setup.bash" >> /root/.bashrc
 
-# Porte UDP per comunicazione socket con il drone Tello:
-# 8889: Comandi SDK (UDP)
-# 8890: Telemetria / Stato del drone (UDP)
-# 11111: Streaming video H.264 (UDP)
+# Porte UDP del Tello: 8889 comandi, 8890 stato, 11111 video
 EXPOSE 8889/udp 8890/udp 11111/udp
 
-# Porta TCP per l'interfaccia web del position_controller (FastAPI/uvicorn +
-# WebSocket di stato). Ininfluente se il container gira con --network host
-# (porta gia' condivisa con l'host), ma dichiarata per chiarezza nel caso
-# in futuro si cambi modalita' di rete.
+# Porta TCP dell'interfaccia web (irrilevante con --network host)
 EXPOSE 8080/tcp
 
 CMD ["bash"]
